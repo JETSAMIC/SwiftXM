@@ -285,16 +285,28 @@ final class XMPlayer {
 
 The render callback runs on the audio thread. `XMMixer` is `@unchecked Sendable` precisely because the host is expected to park it on one thread and never touch it elsewhere. There is no internal locking and concurrent renders will corrupt voice state.
 
-## Status and roadmap
+## Status
 
-The parser handles the full XM header, all pattern data (packed and unpacked variants), all instruments including the extended header (sample map, volume + panning envelopes, auto-vibrato, fade-out), and both 8-bit and 16-bit delta-encoded sample bodies. The mixer implements the full standard effect set, the extended `E` subcommands, the XM-specific commands (`G/H/K/L/P/R/T/X`), the complete volume column, volume + panning envelopes with sustain and loop, and fade-out on key-off. Both linear and Amiga frequency tables work.
+v1 is feature-complete against the XM specification. The parser handles the full header, all pattern data (packed and unpacked variants), all instruments including the extended header (sample map, volume + panning envelopes, auto-vibrato, fade-out), and both 8-bit and 16-bit delta-encoded sample bodies. The mixer implements:
 
-Open issues worth a follow-up pass:
+- Full standard effect set (0..F) plus the extended `E` subcommands
+- XM-specific commands `G/H/K/L/P/R/T/X` (set global volume, global volume slide, key-off, set envelope position, panning slide, multi-retrigger with full per-tick volume change table, tremor, set panning)
+- Complete volume column (set vol, fine slides, slides, vibrato, panning, tone porta)
+- Volume + panning envelopes with sustain and loop
+- Fade-out on key-off
+- **Auto-vibrato** — instrument-level LFO that ramps in over the configured sweep period; the sweep multiplier freezes at key-off so depth doesn't keep growing through the fade
+- **Glissando control** (E3x) — when set, tone-porta snaps the resulting period to the nearest whole-semitone boundary instead of gliding continuously
+- **E9x retrigger** timing fixed so the row's own tick-0 trigger doesn't double-fire; restarts auto-vibrato sweep on each retrigger
+- **EDx note delay** — the row's pending note actually fires on the requested tick instead of getting lost
+- **Rxy retrigger** with the full 16-op volume change table from the XM spec (`x=0..F` driving the linear-delta, ratio, and no-op variants)
+- Both linear and Amiga frequency tables
 
-- Auto-vibrato (instrument-level vibrato applied on every frame; spec calls out the sweep-stays-at-keyoff quirk)
-- Glissando control (E3x — snap tone-porta to whole semitones)
-- Note-cut / note-delay edge cases around E9x retrigger timing
-- Detection-aware quirks for trackers other than FT2 (DigiTrakker, IT2XM, etc.)
+The parser also exposes the writing tracker (`XMFile.writingTracker`) detected from the file's tracker name — FastTracker II, OpenMPT, MilkyTracker, DigiBooster, Schism Tracker, or `.other`. Use it to gate format-specific quirks in your host if you need to; the mixer itself defaults to FT2-compatible semantics across the board, which matches the overwhelming majority of in-the-wild XMs.
+
+Known shape-of-mixing tradeoffs (intentional, not roadmap items):
+
+- The mixer is voice-per-channel (no NNA equivalent). XM doesn't model NNA the way IT does, but a few obscure tracker-quirk modes effectively rely on overlapping voices; those will sound abrupt here.
+- Stereo samples are folded to mono on load — XM allows stereo but it's vanishingly rare in real files.
 
 Contributions welcome; see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 

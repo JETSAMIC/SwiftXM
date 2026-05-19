@@ -60,9 +60,22 @@ public struct XMFile: Sendable {
         case linear
     }
 
+    /// Which tracker wrote this file. Detected from `trackerName`
+    /// at parse time so the mixer can apply small format quirks
+    /// matching the writer's playback semantics.
+    public enum WritingTracker: Sendable, Hashable {
+        case fastTracker2
+        case openMPT
+        case milkyTracker
+        case digiBooster
+        case schism
+        case other
+    }
+
     // Header
     public let moduleName: String
     public let trackerName: String
+    public let writingTracker: WritingTracker
     public let version: UInt16
     public let songLength: Int
     public let restartPosition: Int
@@ -98,6 +111,7 @@ public struct XMFile: Sendable {
         self.moduleName  = Self.readString(data, range: 17..<37)
         // data[37] is the 0x1A DOS EOF byte.
         self.trackerName = Self.readString(data, range: 38..<58)
+        self.writingTracker = Self.detectWritingTracker(name: self.trackerName)
         self.version     = data.readUInt16LE(at: 58)
 
         // The "header size" field at offset 60 is calculated from
@@ -148,6 +162,24 @@ public struct XMFile: Sendable {
     }
 
     // MARK: - Helpers
+
+    /// Map the ASCII `trackerName` field to a writer identity. We
+    /// match case-insensitive substrings against the well-known
+    /// headers shipping XM files in the wild. Unmatched headers
+    /// (including FT2 clones with patched signatures) fall through
+    /// to `.other` — the mixer treats those as FT2-compatible by
+    /// default, which is the conservative choice for unknown files.
+    private static func detectWritingTracker(name: String) -> WritingTracker {
+        let lower = name.lowercased()
+        if lower.contains("openmpt") { return .openMPT }
+        if lower.contains("milkytracker") { return .milkyTracker }
+        if lower.contains("digibooster") { return .digiBooster }
+        if lower.contains("schism") { return .schism }
+        if lower.contains("fasttracker") || lower.contains("ft2") {
+            return .fastTracker2
+        }
+        return .other
+    }
 
     private static func readString(_ data: Data, range: Range<Int>) -> String {
         let bytes = data.subdata(in: range)

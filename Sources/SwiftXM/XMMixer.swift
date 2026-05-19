@@ -145,8 +145,17 @@ public final class XMMixer: @unchecked Sendable {
         var pendingNote: UInt8 = 0
         var pendingInstrument: UInt8 = 0
 
-        // Auto-vibrato sweep counter.
+        // Auto-vibrato state. `autoVibFrame` advances every tick
+        // while the note plays. Once key-off fires the sweep
+        // multiplier freezes at `frozenAutoVibSweep` so the depth
+        // doesn't keep ramping up after release (FT2 quirk).
         var autoVibFrame: Int = 0
+        var frozenAutoVibSweep: Double? = nil
+
+        // Glissando: when set, tone-porta snaps the resulting
+        // period to the nearest whole semitone instead of sliding
+        // continuously (extended effect E3x).
+        var glissandoActive: Bool = false
 
         var active: Bool = false
     }
@@ -607,7 +616,10 @@ public final class XMMixer: @unchecked Sendable {
             voices[channel].period += Double(voices[channel].lastFineSlideDown) * 4
             voices[channel].basePeriod = voices[channel].period
         case 0x3: // Glissando control
-            break
+            // E30 = off (smooth slide, the default); E31 = on
+            // (tone-porta snaps to semitone boundaries). Any non-
+            // zero param enables it.
+            voices[channel].glissandoActive = (v & 0x0F) != 0
         case 0x4: // Vibrato waveform
             voices[channel].vibratoWaveform = v & 0x03
         case 0x5: // Set finetune (modifies period base, not c2spd)
@@ -687,12 +699,36 @@ public final class XMMixer: @unchecked Sendable {
             case 0x0E:
                 let cmd = (cell.param >> 4) & 0x0F
                 let v   = cell.param & 0x0F
+                // ECx note cut: zero the channel volume on tick v.
+                // Conventional FT2 fires the cut on the EXACT tick
+                // requested (so EC1 cuts on tick 1, not tick 0 or
+                // earlier). EC0 cuts immediately on tick 0.
                 if cmd == 0xC && Int(v) == tick {
                     voices[ch].volume = 0
                 }
-                if cmd == 0x9 && v > 0 && tick % Int(v) == 0 {
+                // E9x retrigger: fire on ticks where
+                // `tick % v == 0 && tick > 0` so the note isn't
+                // re-triggered on its own row-start tick (the
+                // original row trigger has already played it).
+                if cmd == 0x9 && v > 0 && tick > 0 && tick % Int(v) == 0 {
                     voices[ch].samplePos = 0
                     voices[ch].active = !voices[ch].sample.isEmpty
+                    voices[ch].autoVibFrame = 0
+                    voices[ch].frozenAutoVibSweep = nil
+                }
+                // EDx note delay: trigger the row's pending note
+                // when `tick == v`. The row's actual note was
+                // queued in `pendingNote` rather than played, so we
+                // fire it here. v == 0 falls through (already played
+                // on tick 0).
+                if cmd == 0xD && Int(v) == tick && v > 0 {
+                    if voices[ch].pendingNote != 0 {
+                        triggerNote(channel: ch,
+                                    note: voices[ch].pendingNote,
+                                    instrument: voices[ch].pendingInstrument)
+                        voices[ch].pendingNote = 0
+                        voices[ch].pendingInstrument = 0
+                    }
                 }
             case 0x11: // H — global volume slide
                 let info = voices[ch].lastGlobalSlide
@@ -707,11 +743,25 @@ public final class XMMixer: @unchecked Sendable {
                 if hi != 0 { voices[ch].panning = min(255, voices[ch].panning + hi) }
                 else if lo != 0 { voices[ch].panning = max(0, voices[ch].panning - lo) }
             case 0x1B: // R — multi retrigger
+                // Param is `0xXY` — X selects a volume-change op
+                // applied each retrigger, Y is the tick interval.
+                // The retrigger restarts the sample position and
+                // the auto-vibrato sweep counter; the volume change
+                // happens on every retrigger after the first.
                 let info = voices[ch].lastRetrigger
-                let interval = Int(info & 0x0F)
-                if interval > 0 && tick % interval == 0 {
+                let xx = Int((info >> 4) & 0x0F)
+                let yy = Int(info & 0x0F)
+                if yy > 0 && tick % yy == 0 {
                     voices[ch].samplePos = 0
                     voices[ch].active = !voices[ch].sample.isEmpty
+                    voices[ch].autoVibFrame = 0
+                    voices[ch].frozenAutoVibSweep = nil
+                    if tick > 0 {
+                        voices[ch].volume = applyRetriggerVolumeOp(
+                            voices[ch].volume,
+                            op: xx
+                        )
+                    }
                 }
             case 0x1D: // T — tremor
                 advanceTremor(channel: ch)
@@ -772,8 +822,65 @@ public final class XMMixer: @unchecked Sendable {
         } else if p > target {
             p = max(target, p - Double(rate))
         }
+        // Glissando control (E3x): snap the sliding period to its
+        // nearest whole-semitone period so the slide steps rather
+        // than glides. Only affects the active-display period; the
+        // tone-porta target still steers the direction.
+        if voices[channel].glissandoActive {
+            p = snapPeriodToSemitone(p, finetune: 0)
+        }
         voices[channel].period = p
         voices[channel].basePeriod = p
+    }
+
+    /// Round `period` to the nearest whole-semitone period in the
+    /// current frequency table. Used by the E3x glissando-control
+    /// flag — when set, tone-porta lands on semitone boundaries
+    /// rather than gliding continuously through them.
+    private func snapPeriodToSemitone(_ period: Double, finetune: Int) -> Double {
+        switch file.frequencyTable {
+        case .linear:
+            // Linear period = 7680 - note*64 - finetune/2 → invert.
+            let approxNote = (7680.0 - period - Double(finetune) / 2.0) / 64.0
+            let nearest = Int(approxNote.rounded())
+            return computePeriod(note: nearest, finetune: finetune)
+        case .amiga:
+            // Amiga periods don't share a simple inverse, so walk
+            // a handful of candidate notes and pick the closest.
+            var bestNote = 0
+            var bestDistance = Double.infinity
+            for n in 0..<120 {
+                let candidate = computePeriod(note: n, finetune: finetune)
+                let d = abs(candidate - period)
+                if d < bestDistance { bestDistance = d; bestNote = n }
+            }
+            return computePeriod(note: bestNote, finetune: finetune)
+        }
+    }
+
+    /// Apply the per-retrigger volume change selected by the high
+    /// nibble of an Rxy parameter. Sixteen ops in total — eight
+    /// linear deltas, two ratios in each direction, and three
+    /// no-ops on the boundary values. Clamps to 0..64.
+    private func applyRetriggerVolumeOp(_ volume: Int, op: Int) -> Int {
+        switch op {
+        case 0, 8: return volume
+        case 1: return max(0, volume - 1)
+        case 2: return max(0, volume - 2)
+        case 3: return max(0, volume - 4)
+        case 4: return max(0, volume - 8)
+        case 5: return max(0, volume - 16)
+        case 6: return max(0, (volume * 2) / 3)
+        case 7: return max(0, volume / 2)
+        case 9: return min(64, volume + 1)
+        case 0xA: return min(64, volume + 2)
+        case 0xB: return min(64, volume + 4)
+        case 0xC: return min(64, volume + 8)
+        case 0xD: return min(64, volume + 16)
+        case 0xE: return min(64, (volume * 3) / 2)
+        case 0xF: return min(64, volume * 2)
+        default: return volume
+        }
     }
 
     private func advanceTremor(channel: Int) {
@@ -823,6 +930,38 @@ public final class XMMixer: @unchecked Sendable {
                 period -= Double(w * voices[c].vibratoDepth) / 16.0
                 voices[c].vibratoPos = (voices[c].vibratoPos + voices[c].vibratoSpeed) & 0x3F
             }
+
+            // Auto-vibrato — instrument-level LFO that runs the
+            // whole time a note is held. The depth ramps up over
+            // `autoVibrato.sweep` frames; once the note keys off,
+            // we freeze the sweep multiplier so the depth doesn't
+            // keep growing through the fade-out (FT2 quirk).
+            let avInsIdx = voices[c].instrumentIndex
+            if avInsIdx >= 0, avInsIdx < file.instruments.count {
+                let ins = file.instruments[avInsIdx]
+                let av = ins.autoVibrato
+                if av.rate > 0 && av.depth > 0 {
+                    let sweep = Int(av.sweep)
+                    let frame = voices[c].autoVibFrame
+                    let liveMult: Double = sweep > 0
+                        ? min(1.0, Double(frame) / Double(sweep))
+                        : 1.0
+                    let mult: Double
+                    if voices[c].keyOff {
+                        if voices[c].frozenAutoVibSweep == nil {
+                            voices[c].frozenAutoVibSweep = liveMult
+                        }
+                        mult = voices[c].frozenAutoVibSweep ?? liveMult
+                    } else {
+                        mult = liveMult
+                    }
+                    let pos = (frame * Int(av.rate) / 4) & 0x3F
+                    let w = waveformSample(pos: pos, waveform: av.type)
+                    period -= Double(w) * Double(av.depth) * mult / 64.0
+                    voices[c].autoVibFrame &+= 1
+                }
+            }
+
             period = max(1, period)
             let freq = frequency(forPeriod: period)
             voices[c].effectiveStep = freq / sampleRate
