@@ -9,7 +9,7 @@ struct XMMixerTests {
     func rendersSilenceWithoutCrashing() throws {
         let data = makeEmptyModule()
         let file = try XMFile(data: data)
-        let mixer = XMMixer(file: file, sampleRate: 44_100)
+        let mixer = try XMMixer(file: file, sampleRate: 44_100)
 
         let frames = 256
         var buffer = [Float](repeating: 1.0, count: frames * 2)
@@ -25,7 +25,7 @@ struct XMMixerTests {
     func finishesEmptyOrderList() throws {
         let data = makeEmptyModule()
         let file = try XMFile(data: data)
-        let mixer = XMMixer(file: file, sampleRate: 44_100)
+        let mixer = try XMMixer(file: file, sampleRate: 44_100)
 
         let frames = 8_192
         var buffer = [Float](repeating: 0, count: frames * 2)
@@ -40,7 +40,7 @@ struct XMMixerTests {
     func sampleRate() throws {
         let data = makeEmptyModule()
         let file = try XMFile(data: data)
-        let mixer = XMMixer(file: file, sampleRate: 48_000)
+        let mixer = try XMMixer(file: file, sampleRate: 48_000)
         #expect(mixer.sampleRate == 48_000)
     }
 }
