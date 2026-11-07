@@ -1,205 +1,265 @@
 /// XMMixer.swift
 ///
-/// Software mixer for an `XMFile`. Iterates the order table,
-/// applies the full XM effect set (standard `0..F`, extended `E`
-/// subcommands, plus `G/H/K/L/P/R/T/X` and the volume column),
-/// processes volume + panning envelopes and fade-out, and writes
-/// interleaved stereo `Float32` PCM into a caller-provided buffer.
+/// Software mixer for an `XMFile`. Iterates the order table, applies
+/// the XM effect set (`0`-`F`, `E` subcommands, `G H K L P R T X` and
+/// the volume column), runs volume / panning envelopes, fade-out and
+/// auto-vibrato, and writes interleaved stereo `Float32` PCM into a
+/// caller-provided buffer.
+///
+/// Playback follows FastTracker II's replayer (as documented in
+/// `Reference/xm-form.txt` and reproduced by ft2-clone): per-effect
+/// memories, FT2's flow state (`pBreakPos`, position-jump flag,
+/// per-channel `E6x` loops including the "next pattern starts at the
+/// loop row" quirk), `EEx` repeats that only run per-tick effects, the
+/// tick-counter-based arpeggio order, and FT2's vibrato / tremolo /
+/// tremor / multi-retrig arithmetic.
 ///
 /// ## Timing model
-/// XM uses the same speed/tempo split as S3M: `speed` (effect `Fxx`,
-/// 1..31) is ticks per row and `tempo` (`Fxx` >= 32, FT2 calls this
-/// "BPM") drives the tick rate, with:
-///
-/// ```
-/// tickRateHz       = tempo * 2 / 5
-/// samplesPerTick   = sampleRate / tickRateHz
-/// samplesPerRow    = samplesPerTick * speed
-/// ```
-///
-/// Note triggers fire on tick 0; continuous effects (slides,
-/// vibrato, tremolo, arpeggio, envelopes, fade-out) advance every
-/// tick.
+/// `speed` (effect `Fxx` < 0x20) is ticks per row; `bpm` (`Fxx` >=
+/// 0x20) drives the tick rate: `tickRateHz = bpm * 2 / 5`.
 ///
 /// ## Frequency tables
-/// XM ships two: linear and Amiga. This implementation supports
-/// both, switching automatically based on `XMFile.frequencyTable`.
-/// Most modern XMs use linear (the FT2 default); the Amiga table
-/// covers Protracker-imported material.
-///
-/// ## Threading
-/// Single-owner mutable state. The host parks the mixer on one
-/// thread (typically `AVAudioSourceNode`'s render thread) and
-/// never touches it elsewhere. `XMMixer` is `@unchecked Sendable`
-/// for this exact pattern; concurrent renders would corrupt voice
-/// state.
+/// - Linear: `period = 7680 - note*64 - finetune/2`,
+///   `Hz = 8363 * 2^((4608 - period) / 768)`.
+/// - Amiga: FT2's 96-entry period table, interpolated for finetune,
+///   `Hz = 8363 * 1712 / period`.
+/// `note` is 0-based here (C-0 = 0), i.e. pattern note - 1 + the
+/// sample's relative note.
 
 import Foundation
 
+/// Renders an ``XMFile`` to interleaved stereo `Float32` PCM.
+///
+/// The mixer is a single-threaded state machine: each call to
+/// ``render(into:frames:)`` advances playback. It is marked
+/// `@unchecked Sendable` so it can be handed to an audio render
+/// callback, but it has no internal locking: confine all calls to one
+/// thread (or one serial context) at a time.
+///
+/// Playback stops (``finished`` becomes `true`) at the end of the
+/// order list or when the song loops back to a row it already played,
+/// so rendering always terminates.
 public final class XMMixer: @unchecked Sendable {
 
     // MARK: - Configuration
 
+    /// Output sample rate, in Hz.
     public let sampleRate: Double
+
+    // MARK: - Public playback state
+
+    /// `true` once playback has ended: the order list was exhausted
+    /// or the song looped back to an already-played row.
+    public private(set) var finished: Bool = false
+
+    /// Index into ``XMFile/order`` of the row being played.
+    public var currentOrder: Int { songPos }
+
+    /// Row within the current pattern.
+    public var currentRow: Int { row }
 
     // MARK: - Module state
 
     private let file: XMFile
-    private var orderIndex: Int = 0
-    private var patternIndex: Int = 0
-    private var row: Int = 0
-    private var tick: Int = 0
+    private let linear: Bool
+    private let mixScale: Float
+    private var songPos = 0
+    private var row = 0
+    private var tick = 0
     private var speed: Int
-    private var tempo: Int
-    private var globalVolume: Int = 64
-    private var framesRemainingInTick: Int = 0
+    private var bpm: Int
+    private var globalVolume = 64
+    private var pattern: XMPattern
+
+    // FT2 flow state.
+    private var breakPos = 0
+    private var breakFlag = false
+    private var posJumpFlag = false
+    private var jumpTarget: Int?
+    private var patternDelay = 0
+    private var inRowRepeat = false
+
+    // Loop detection.
+    private var visitedRows: Set<Int> = []
+    private var rowBudget: Int
+
+    private var framesRemainingInTick = 0
+    private var tickFrameFraction = 0.0
     private var voices: [Voice]
-
-    /// Set to `true` once the last order has played to completion.
-    public private(set) var finished: Bool = false
-
-    // Pattern loop / pattern delay state.
-    private var patternLoopRow: Int = 0
-    private var patternLoopCount: Int = 0
-    private var pendingRowRepeats: Int = 0
-    private var suppressNoteTriggers: Bool = false
-    private var rowJumped: Bool = false
 
     // MARK: - Voice state
 
     private struct Voice {
-        var instrumentIndex: Int = 0
-        var sampleIndex: Int = 0
-        var sample: [Int16] = []
-        var samplePos: Double = 0
-        var sampleLoopBegin: Int = 0
-        var sampleLoopEnd: Int = 0
-        var sampleLoopMode: XMSample.LoopMode = .none
-        var samplePingPongForward: Bool = true
+        // Sample playback.
+        var pcm: [Int16] = []
+        var loopStart = 0
+        var loopEnd = 0
+        var loopMode: XMSample.LoopMode = .none
+        var pos: Double = 0
+        var forward = true
+        var active = false
+        var step: Double = 0
 
-        /// Current period (linear or Amiga depending on table).
+        var instrument = 0          // 1-based, 0 = none
+        var sampleIndex = -1
+        var note = 0                // last pattern note 1...96
+        var relativeNote = 0
+        var finetune = 0
+
+        // Pitch (FT2 realPeriod / outPeriod).
         var period: Double = 0
-        /// Original period set by the last note trigger (vibrato
-        /// modulation hangs off this value).
-        var basePeriod: Double = 0
-        var tonePortaTarget: Double = 0
-        /// Frame increment used by the mixer per output sample.
-        var effectiveStep: Double = 0
+        var outPeriod: Double = 0
+        var targetPeriod: Double = 0
+        var portaSpeed = 0          // 3xx / Mx memory, already * 4
 
-        /// Channel volume 0..64.
-        var volume: Int = 64
-        /// Envelope+fadeout-adjusted volume the mixer renders with.
-        var effectiveVolume: Double = 1.0
+        // Volume / panning.
+        var volume = 0
+        var outVolume = 0
+        var panning = 128
+        var finalVolume: Float = 0
+        var finalPan: Float = 0
 
-        /// Channel panning 0..255. 128 = centre.
-        var panning: Int = 128
-        var effectivePan: Float = 0
+        // Instrument state.
+        var keyOff = false
+        var fadeout = 32768
+        var volEnvFrame = 0
+        var panEnvFrame = 0
+        var autoVibPos = 0
+        var autoVibAmp = 0
+        var autoVibSweep = 0
 
-        /// 0..65535. Decrements by instrument.fadeout each tick
-        /// after key-off (when the volume envelope is enabled).
-        var fadeoutVol: Int = 65_536
-        var keyOff: Bool = false
+        // Effect memories (FT2 keeps one per effect).
+        var memPortaUp: UInt8 = 0
+        var memPortaDown: UInt8 = 0
+        var memFinePortaUp: UInt8 = 0
+        var memFinePortaDown: UInt8 = 0
+        var memExtraFineUp: UInt8 = 0
+        var memExtraFineDown: UInt8 = 0
+        var memVolSlide: UInt8 = 0
+        var memFineVolUp: UInt8 = 0
+        var memFineVolDown: UInt8 = 0
+        var memGlobalSlide: UInt8 = 0
+        var memPanSlide: UInt8 = 0
+        var memOffset: UInt8 = 0
+        var memTremor: UInt8 = 0
 
-        // Envelope frame counters (advance every tick when enabled).
-        var volEnvFrame: Int = 0
-        var panEnvFrame: Int = 0
-        var volEnvOn: Bool = false
-        var panEnvOn: Bool = false
+        var vibratoPos = 0          // 0...255
+        var vibratoSpeed = 0        // already * 4
+        var vibratoDepth = 0
+        var tremoloPos = 0
+        var tremoloSpeed = 0
+        var tremoloDepth = 0
+        var waveControl = 0         // E4x low nibble, E7x high nibble
+        var glissando = false
+        var retrigVolume = 0
+        var retrigSpeed = 0
+        var retrigCount = 0
+        var tremorPos: UInt8 = 0
 
-        // Effect memories.
-        var lastPortaUp: UInt8 = 0
-        var lastPortaDown: UInt8 = 0
-        var lastTonePorta: UInt8 = 0
-        var lastVibrato: UInt8 = 0
-        var lastTremolo: UInt8 = 0
-        var lastVolumeSlide: UInt8 = 0
-        var lastFineSlideUp: UInt8 = 0
-        var lastFineSlideDown: UInt8 = 0
-        var lastSampleOffset: UInt8 = 0
-        var lastGlobalSlide: UInt8 = 0
-        var lastPanSlide: UInt8 = 0
-        var lastRetrigger: UInt8 = 0
-        var lastExtraFineUp: UInt8 = 0
-        var lastExtraFineDown: UInt8 = 0
-        var lastTremor: UInt8 = 0
+        // Per-channel E6x loop (FT2).
+        var loopRow = 0
+        var loopCount = 0
 
-        // Vibrato + tremolo oscillators.
-        var vibratoPos: Int = 0
-        var vibratoSpeed: Int = 0
-        var vibratoDepth: Int = 0
-        var vibratoWaveform: UInt8 = 0
-        var vibratoActive: Bool = false
-        var tremoloPos: Int = 0
-        var tremoloSpeed: Int = 0
-        var tremoloDepth: Int = 0
-        var tremoloWaveform: UInt8 = 0
-        var tremoloActive: Bool = false
-
-        // Tremor (Txx).
-        var tremorOn: Bool = true
-        var tremorCount: Int = 0
-        var tremorActive: Bool = false
-
-        // Per-row pending note (only triggered after volume column
-        // + effect parse so tone-porta can suppress retrigger).
-        var pendingNote: UInt8 = 0
-        var pendingInstrument: UInt8 = 0
-
-        // Auto-vibrato state. `autoVibFrame` advances every tick
-        // while the note plays. Once key-off fires the sweep
-        // multiplier freezes at `frozenAutoVibSweep` so the depth
-        // doesn't keep ramping up after release (FT2 quirk).
-        var autoVibFrame: Int = 0
-        var frozenAutoVibSweep: Double? = nil
-
-        // Glissando: when set, tone-porta snaps the resulting
-        // period to the nearest whole semitone instead of sliding
-        // continuously (extended effect E3x).
-        var glissandoActive: Bool = false
-
-        var active: Bool = false
+        // The row's cell and EDx state.
+        var cell = XMPattern.Cell()
+        var delayedCell: XMPattern.Cell?
+        var delayTick = -1
     }
+
+    // MARK: - Tables
+
+    /// FT2 / ProTracker vibrato half-sine (32 entries, peak 255).
+    private static let vibratoTable: [Int] = [
+        0, 24, 49, 74, 97, 120, 141, 161, 180, 197, 212, 224, 235, 244, 250, 253,
+        255, 253, 250, 244, 235, 224, 212, 197, 180, 161, 141, 120, 97, 74, 49, 24
+    ]
+
+    /// FT2 auto-vibrato sine (256 entries, ±64, negative first).
+    private static let autoVibratoSine: [Int] = (0..<256).map {
+        -Int((64 * sin(Double($0) * 2 * .pi / 256)).rounded())
+    }
+
+    /// FT2 Amiga period table: 12 notes × 8 finetune steps, starting a
+    /// semitone below C (see Reference/xm-form.txt).
+    private static let amigaPeriods: [Double] = [
+        907, 900, 894, 887, 881, 875, 868, 862, 856, 850, 844, 838, 832, 826, 820, 814,
+        808, 802, 796, 791, 785, 779, 774, 768, 762, 757, 752, 746, 741, 736, 730, 725,
+        720, 715, 709, 704, 699, 694, 689, 684, 678, 675, 670, 665, 660, 655, 651, 646,
+        640, 636, 632, 628, 623, 619, 614, 610, 604, 601, 597, 592, 588, 584, 580, 575,
+        570, 567, 563, 559, 555, 551, 547, 543, 538, 535, 532, 528, 524, 520, 516, 513,
+        508, 505, 502, 498, 494, 491, 487, 484, 480, 477, 474, 470, 467, 463, 460, 457
+    ]
+
+    private static let periodRange: ClosedRange<Double> = 1...31999
 
     // MARK: - Init
 
-    public init(file: XMFile, sampleRate: Double) {
+    /// Creates a mixer positioned at the start of the song.
+    ///
+    /// - Parameters:
+    ///   - file: The parsed module to play.
+    ///   - sampleRate: Output sample rate in hertz, for example
+    ///     `44_100` or `48_000`.
+    /// - Throws: ``XMError/invalidSampleRate`` if `sampleRate` is not
+    ///   finite or not in `1...1_000_000`.
+    public init(file: XMFile, sampleRate: Double) throws {
+        guard sampleRate.isFinite, sampleRate >= 1, sampleRate <= 1_000_000 else {
+            throw XMError.invalidSampleRate
+        }
         self.file = file
         self.sampleRate = sampleRate
-        self.speed = max(1, file.defaultTempo)
-        self.tempo = max(32, file.defaultBPM)
+        self.linear = file.frequencyTable == .linear
+        self.speed = file.defaultTempo == 0 ? 6 : min(31, file.defaultTempo)
+        self.bpm = file.defaultBPM == 0 ? 125 : max(32, min(255, file.defaultBPM))
+        self.mixScale = 1 / Float(max(1, min(32, file.channelCount)))
         self.voices = Array(repeating: Voice(), count: file.channelCount)
-        // Default per-channel panning: even channels left of
-        // centre, odd channels right (classic Amiga LRRL).
-        for i in 0..<file.channelCount {
-            // FT2 defaults all channels to centre (128).
-            voices[i].panning = 128
-            voices[i].effectivePan = 0
+        self.pattern = XMPattern.empty(channels: file.channelCount)
+
+        var totalRows = 0
+        for i in 0..<file.songLength {
+            let p = Int(file.order[i])
+            totalRows += p < file.patterns.count ? file.patterns[p].rowCount : 64
         }
-        self.framesRemainingInTick = framesPerTick()
-        beginRow(applyNotes: true)
-        recomputeEffectiveState()
+        self.rowBudget = totalRows * 32 + 1024
+
+        if file.songLength > 0 {
+            loadPattern()
+            enterRow()
+        } else {
+            finished = true
+        }
+        framesRemainingInTick = nextTickFrameCount()
     }
 
     // MARK: - Render entry point
 
+    /// Renders up to `frames` interleaved stereo frames (`L R L R …`)
+    /// into `buffer`, which must have room for `frames * 2` floats.
+    ///
+    /// - Parameters:
+    ///   - buffer: Destination for `frames * 2` interleaved samples,
+    ///     nominally in -1...1 (not clipped).
+    ///   - frames: Number of stereo frames requested. Values <= 0
+    ///     render nothing.
+    /// - Returns: The number of frames rendered. Less than `frames`
+    ///   means the song ended; the unwritten tail is zero-filled.
     @discardableResult
     public func render(into buffer: UnsafeMutablePointer<Float>, frames: Int) -> Int {
+        guard frames > 0 else { return 0 }
         var written = 0
-        while written < frames {
-            if finished { break }
+        while written < frames && !finished {
+            if framesRemainingInTick == 0 {
+                advanceTick()
+                framesRemainingInTick = nextTickFrameCount()
+                continue
+            }
             let toWrite = min(frames - written, framesRemainingInTick)
             renderChunk(into: buffer.advanced(by: written * 2), frames: toWrite)
             written += toWrite
             framesRemainingInTick -= toWrite
-            if framesRemainingInTick == 0 {
-                advanceTick()
-                if finished { break }
-                framesRemainingInTick = framesPerTick()
-            }
         }
         if written < frames {
-            let tail = (frames - written) * 2
-            buffer.advanced(by: written * 2).update(repeating: 0, count: tail)
+            buffer.advanced(by: written * 2).update(repeating: 0, count: (frames - written) * 2)
         }
         return written
     }
@@ -213,889 +273,824 @@ public final class XMMixer: @unchecked Sendable {
         }
     }
 
-    private func mixVoice(into buffer: UnsafeMutablePointer<Float>, frames: Int, voice: Int) {
-        let amp = Float(voices[voice].effectiveVolume) *
-                  Float(globalVolume) / 64.0 /
-                  Float(max(1, min(32, file.channelCount)))
-        let pan = voices[voice].effectivePan
-        let panL = max(0, (1 - pan) * 0.5)
-        let panR = max(0, (1 + pan) * 0.5)
+    private func mixVoice(into buffer: UnsafeMutablePointer<Float>, frames: Int, voice v: Int) {
+        let amp = voices[v].finalVolume * mixScale
+        let pan = voices[v].finalPan
+        let ampL = amp * (1 - pan) * 0.5
+        let ampR = amp * (1 + pan) * 0.5
+        let pcm = voices[v].pcm
+        let mode = voices[v].loopMode
+        let loopStart = voices[v].loopStart
+        let loopEnd = voices[v].loopEnd
+        let end = mode == .none ? pcm.count : loopEnd
+        let loopLength = Double(loopEnd - loopStart)
+        let step = voices[v].step
+        var pos = voices[v].pos
+        var forward = voices[v].forward
 
-        let sample = voices[voice].sample
-        let loopBegin = voices[voice].sampleLoopBegin
-        let loopEnd = voices[voice].sampleLoopEnd
-        let loopMode = voices[voice].sampleLoopMode
-        var pos = voices[voice].samplePos
-        var forward = voices[voice].samplePingPongForward
-        let step = voices[voice].effectiveStep
+        for i in 0..<frames {
+            let index = min(Int(pos), end - 1)
+            let s0 = Float(pcm[index])
+            let next: Int
+            if forward {
+                next = index + 1 < end ? index + 1 : (mode == .forward ? loopStart : index)
+            } else {
+                next = index > loopStart ? index - 1 : index
+            }
+            let frac = Float(pos - Double(Int(pos)))
+            let s = (s0 + (Float(pcm[next]) - s0) * frac) / 32768
+            buffer[i * 2] += s * ampL
+            buffer[i * 2 + 1] += s * ampR
 
-        guard sample.count > 0 else {
-            voices[voice].active = false
+            switch mode {
+            case .none:
+                pos += step
+                if pos >= Double(end) {
+                    voices[v].active = false
+                    voices[v].pos = pos
+                    return
+                }
+            case .forward:
+                pos += step
+                if pos >= Double(loopEnd) {
+                    pos = Double(loopStart) + (pos - Double(loopStart)).truncatingRemainder(dividingBy: loopLength)
+                }
+            case .pingPong:
+                // Unfold the bounce into a phase u in [0, 2L): u < L
+                // runs forward from loopStart, u >= L runs backward.
+                var u: Double
+                if forward && pos < Double(loopStart) {
+                    pos += step
+                    if pos < Double(loopStart) { continue }
+                    u = pos - Double(loopStart)
+                } else {
+                    u = (forward ? pos - Double(loopStart) : 2 * loopLength - (pos - Double(loopStart))) + step
+                }
+                u = u.truncatingRemainder(dividingBy: 2 * loopLength)
+                if u < loopLength {
+                    pos = Double(loopStart) + u
+                    forward = true
+                } else {
+                    pos = Double(loopStart) + (2 * loopLength - u)
+                    forward = false
+                }
+            }
+        }
+        voices[v].pos = pos
+        voices[v].forward = forward
+    }
+
+    // MARK: - Song navigation
+
+    private func loadPattern() {
+        let index = Int(file.order[songPos])
+        pattern = index < file.patterns.count ? file.patterns[index] : .empty(channels: file.channelCount)
+    }
+
+    private func enterRow() {
+        rowBudget -= 1
+        let key = songPos << 16 | row
+        if rowBudget < 0 || visitedRows.contains(key) {
+            finished = true
+            return
+        }
+        visitedRows.insert(key)
+        inRowRepeat = false
+        processTick0()
+        updateOutputs()
+    }
+
+    /// End of a row: run `EEx` repeats, then FT2's position logic.
+    private func finishRow() {
+        if patternDelay > 0 {
+            patternDelay -= 1
+            inRowRepeat = true
+            // FT2 does not re-read the row; the first tick of each
+            // repeat runs the per-tick effects instead.
+            processTickN()
+            updateOutputs()
             return
         }
 
-        for i in 0..<frames {
-            var intPos = Int(pos)
-            if intPos >= sample.count {
-                // End of sample: handle loop modes.
-                switch loopMode {
-                case .none:
-                    voices[voice].active = false
-                    voices[voice].samplePos = pos
-                    voices[voice].samplePingPongForward = forward
-                    return
-                case .forward:
-                    if loopEnd > loopBegin {
-                        let span = Double(loopEnd - loopBegin)
-                        pos = Double(loopBegin) + (pos - Double(loopBegin)).truncatingRemainder(dividingBy: span)
-                        intPos = Int(pos)
-                    } else {
-                        voices[voice].active = false
-                        return
-                    }
-                case .pingPong:
-                    if loopEnd > loopBegin {
-                        pos = Double(loopEnd) - (pos - Double(loopEnd)) - 1
-                        forward = false
-                        intPos = Int(pos)
-                    } else {
-                        voices[voice].active = false
-                        return
-                    }
-                }
+        let previousRow = row
+        var next = row + 1
+        var loopJump = false
+        if breakFlag {
+            breakFlag = false
+            next = breakPos
+            loopJump = true
+        }
+        if next >= pattern.rowCount || posJumpFlag {
+            next = breakPos
+            breakPos = 0
+            posJumpFlag = false
+            loopJump = false
+            songPos = jumpTarget ?? songPos + 1
+            jumpTarget = nil
+            guard songPos >= 0, songPos < file.songLength else {
+                finished = true
+                return
             }
-            if intPos < 0 {
-                if loopMode == .pingPong {
-                    pos = Double(loopBegin) + (Double(loopBegin) - pos)
-                    forward = true
-                    intPos = Int(pos)
-                } else {
-                    voices[voice].active = false
-                    return
-                }
-            }
-
-            let s0 = Float(sample[intPos]) / 32768.0
-            let s1Idx = intPos + 1
-            let s1 = s1Idx < sample.count ? Float(sample[s1Idx]) / 32768.0 : s0
-            let frac = Float(pos - Double(intPos))
-            let s = s0 + (s1 - s0) * frac
-
-            buffer[i * 2]     += s * amp * panL
-            buffer[i * 2 + 1] += s * amp * panR
-
-            if forward {
-                pos += step
-                if loopMode == .pingPong && pos >= Double(loopEnd) {
-                    forward = false
-                }
-            } else {
-                pos -= step
-                if pos <= Double(loopBegin) {
-                    pos = Double(loopBegin) + (Double(loopBegin) - pos)
-                    forward = true
-                }
+            loadPattern()
+            if next >= pattern.rowCount { next = 0 }
+        }
+        row = next
+        if loopJump {
+            for r in min(row, previousRow)...max(row, previousRow) {
+                visitedRows.remove(songPos << 16 | r)
             }
         }
-        voices[voice].samplePos = pos
-        voices[voice].samplePingPongForward = forward
+        enterRow()
     }
 
-    // MARK: - Tick / row advancement
-
     private func advanceTick() {
+        guard !finished else { return }
         tick += 1
         if tick >= speed {
             tick = 0
-            if pendingRowRepeats > 0 {
-                pendingRowRepeats -= 1
-                suppressNoteTriggers = true
-                beginRow(applyNotes: false)
-                suppressNoteTriggers = false
-            } else if rowJumped {
-                rowJumped = false
-                if !nextValidOrder() { finished = true; return }
-                beginRow(applyNotes: true)
-            } else {
-                row += 1
-                let pattern = file.patterns[patternIndex]
-                if row >= pattern.rowCount {
-                    row = 0
-                    orderIndex += 1
-                    if !nextValidOrder() { finished = true; return }
-                }
-                beginRow(applyNotes: true)
-            }
+            finishRow()
         } else {
-            applyTickEffects()
+            processTickN()
+            updateOutputs()
         }
-        advanceEnvelopes()
-        recomputeEffectiveState()
     }
 
-    private func nextValidOrder() -> Bool {
-        while orderIndex < file.songLength && orderIndex < file.order.count {
-            let p = Int(file.order[orderIndex])
-            if p < file.patterns.count {
-                patternIndex = p
-                return true
-            }
-            orderIndex += 1
-        }
-        return false
-    }
+    // MARK: - Tick 0
 
-    private func beginRow(applyNotes: Bool) {
-        guard patternIndex < file.patterns.count else {
-            finished = true; return
-        }
-        let pattern = file.patterns[patternIndex]
-        guard row >= 0 && row < pattern.rowCount else { return }
-        let cells = pattern.rows[row]
-
-        // Reset per-row effect overlays.
+    private func processTick0() {
         for c in 0..<voices.count {
-            voices[c].vibratoActive = false
-            voices[c].tremoloActive = false
-            voices[c].tremorActive = false
-        }
-
-        for ch in 0..<min(cells.count, voices.count) {
-            let cell = cells[ch]
-            applyTriggerCell(channel: ch, cell: cell, applyNotes: applyNotes)
+            let cell = pattern.cell(row: row, channel: c)
+            voices[c].cell = cell
+            voices[c].delayedCell = nil
+            voices[c].delayTick = -1
+            if cell.effect == 0x0E && cell.param >> 4 == 0xD && cell.param & 0x0F != 0 {
+                // EDx: the whole cell (note, instrument, volume column)
+                // plays on tick x.
+                voices[c].delayedCell = cell
+                voices[c].delayTick = Int(cell.param & 0x0F)
+                continue
+            }
+            triggerCell(channel: c, cell: cell)
+            effectTick0(channel: c, cell: cell)
         }
     }
 
-    private func applyTriggerCell(channel: Int, cell: XMPattern.Cell, applyNotes: Bool) {
-        let usesTonePorta = cell.effect == 0x03 || cell.effect == 0x05
-            || (XMVolumeCommand(byte: cell.volume) as XMVolumeCommand) == .tonePorta(0)
+    /// Instrument, note and tick-0 volume-column handling (FT2's
+    /// "Play / Switch / OldVol / Cut" table).
+    private func triggerCell(channel c: Int, cell: XMPattern.Cell) {
+        let porta = cell.effect == 0x03 || cell.effect == 0x05 || cell.volume >= 0xF0
+        // Porta speed and offset memories are needed before the note.
+        if cell.effect == 0x03 && cell.param != 0 { voices[c].portaSpeed = Int(cell.param) * 4 }
+        if cell.volume >= 0xF0 && cell.volume & 0x0F != 0 { voices[c].portaSpeed = Int(cell.volume & 0x0F) * 64 }
+        if cell.effect == 0x09 && cell.param != 0 { voices[c].memOffset = cell.param }
 
-        // Handle note delay (E Dx) before everything else.
-        if cell.effect == 0x0E && (cell.param >> 4) == 0xD && applyNotes {
-            voices[channel].pendingNote = cell.note
-            voices[channel].pendingInstrument = cell.instrument
-            // Effects still run on tick 0 in FT2; we no-op the
-            // note trigger and let the tick effects fire.
-            applyEffectTick0(channel: channel, effect: cell.effect, param: cell.param)
-            applyVolumeColumn(channel: channel, byte: cell.volume)
-            return
+        var instrumentValid = true
+        if cell.instrument > 0 {
+            if Int(cell.instrument) <= file.instruments.count {
+                voices[c].instrument = Int(cell.instrument)
+            } else {
+                instrumentValid = false
+            }
         }
 
-        if applyNotes {
-            // Instrument set: load defaults but don't trigger
-            // sample yet (sample swap happens with the note).
-            if cell.instrument > 0 {
-                installInstrumentDefaults(channel: channel, instrument: cell.instrument)
-            }
-            // Note?
-            if cell.note > 0 && cell.note <= 97 {
-                if cell.note == 97 {
-                    voices[channel].keyOff = true
-                } else if usesTonePorta {
-                    setTonePortaTarget(channel: channel, note: cell.note)
-                } else {
-                    triggerNote(channel: channel, note: cell.note, instrument: cell.instrument)
+        let note = Int(cell.note)
+        if note == 97 {
+            keyOff(channel: c)
+        } else if (1...96).contains(note) {
+            if porta && voices[c].period > 0 {
+                if voices[c].portaSpeed > 0 {
+                    voices[c].targetPeriod = periodFor(note: note - 1 + voices[c].relativeNote,
+                                                       finetune: voices[c].finetune)
                 }
-            }
-        }
-
-        applyVolumeColumn(channel: channel, byte: cell.volume)
-        applyEffectTick0(channel: channel, effect: cell.effect, param: cell.param)
-    }
-
-    private func installInstrumentDefaults(channel: Int, instrument: UInt8) {
-        let idx = Int(instrument) - 1
-        guard idx >= 0, idx < file.instruments.count else { return }
-        let ins = file.instruments[idx]
-        voices[channel].instrumentIndex = idx
-        // FT2 sets the default sample for the current note (or
-        // the previous note if no new note this row).
-        if let sampleIdx = sampleIndex(for: voices[channel].pendingNote, instrument: ins),
-           sampleIdx < ins.samples.count {
-            voices[channel].volume  = Int(ins.samples[sampleIdx].volume)
-            voices[channel].panning = Int(ins.samples[sampleIdx].panning)
-        }
-        voices[channel].volEnvOn = ins.volumeEnvelope.enabled
-        voices[channel].panEnvOn = ins.panningEnvelope.enabled
-        voices[channel].fadeoutVol = 65_536
-        voices[channel].keyOff = false
-        voices[channel].volEnvFrame = 0
-        voices[channel].panEnvFrame = 0
-    }
-
-    private func triggerNote(channel: Int, note: UInt8, instrument: UInt8) {
-        let insIdx = instrument > 0
-            ? Int(instrument) - 1
-            : voices[channel].instrumentIndex
-        guard insIdx >= 0, insIdx < file.instruments.count else { return }
-        let ins = file.instruments[insIdx]
-        guard let sampleIdx = sampleIndex(for: note, instrument: ins),
-              sampleIdx < ins.samples.count else {
-            voices[channel].active = false
-            return
-        }
-        let smp = ins.samples[sampleIdx]
-        voices[channel].instrumentIndex = insIdx
-        voices[channel].sampleIndex = sampleIdx
-        voices[channel].sample = smp.pcm
-        voices[channel].sampleLoopBegin = smp.loopBegin
-        voices[channel].sampleLoopEnd = smp.loopEnd
-        voices[channel].sampleLoopMode = smp.loopMode
-        voices[channel].samplePingPongForward = true
-        voices[channel].samplePos = 0
-        voices[channel].volume = Int(smp.volume)
-        voices[channel].panning = Int(smp.panning)
-        voices[channel].volEnvOn = ins.volumeEnvelope.enabled
-        voices[channel].panEnvOn = ins.panningEnvelope.enabled
-        voices[channel].volEnvFrame = 0
-        voices[channel].panEnvFrame = 0
-        voices[channel].fadeoutVol = 65_536
-        voices[channel].keyOff = false
-        voices[channel].vibratoPos = 0
-        voices[channel].tremoloPos = 0
-        voices[channel].autoVibFrame = 0
-        voices[channel].active = !smp.pcm.isEmpty
-        voices[channel].pendingNote = note
-
-        let realNote = Int(note) + Int(smp.relativeNote)
-        let period = computePeriod(note: realNote, finetune: Int(smp.finetune))
-        voices[channel].period = period
-        voices[channel].basePeriod = period
-        voices[channel].tonePortaTarget = period
-    }
-
-    private func setTonePortaTarget(channel: Int, note: UInt8) {
-        let insIdx = voices[channel].instrumentIndex
-        guard insIdx >= 0, insIdx < file.instruments.count else { return }
-        let ins = file.instruments[insIdx]
-        guard let sampleIdx = sampleIndex(for: note, instrument: ins),
-              sampleIdx < ins.samples.count else { return }
-        let smp = ins.samples[sampleIdx]
-        let realNote = Int(note) + Int(smp.relativeNote)
-        voices[channel].tonePortaTarget = computePeriod(note: realNote, finetune: Int(smp.finetune))
-        voices[channel].pendingNote = note
-    }
-
-    private func sampleIndex(for note: UInt8, instrument: XMInstrument) -> Int? {
-        guard note >= 1 && note <= 96 else { return nil }
-        return Int(instrument.sampleMap[Int(note) - 1])
-    }
-
-    // MARK: - Volume column
-
-    private func applyVolumeColumn(channel: Int, byte: UInt8) {
-        let cmd = XMVolumeCommand(byte: byte)
-        switch cmd {
-        case .none: break
-        case .setVolume(let v):
-            voices[channel].volume = Int(min(64, v))
-        case .slideDown(let v):
-            voices[channel].lastVolumeSlide = v
-        case .slideUp(let v):
-            voices[channel].lastVolumeSlide = v << 4
-        case .fineSlideDown(let v):
-            voices[channel].volume = max(0, voices[channel].volume - Int(v))
-        case .fineSlideUp(let v):
-            voices[channel].volume = min(64, voices[channel].volume + Int(v))
-        case .setVibratoSpeed(let v):
-            if v != 0 { voices[channel].vibratoSpeed = Int(v) }
-        case .vibrato(let depth):
-            if depth != 0 { voices[channel].vibratoDepth = Int(depth) }
-            voices[channel].vibratoActive = true
-        case .setPanning(let v):
-            voices[channel].panning = Int(v)
-        case .panSlideLeft(let v):
-            voices[channel].panning = max(0, voices[channel].panning - Int(v))
-        case .panSlideRight(let v):
-            voices[channel].panning = min(255, voices[channel].panning + Int(v))
-        case .tonePorta(let rate):
-            if rate != 0 { voices[channel].lastTonePorta = rate }
-        }
-    }
-
-    // MARK: - Effects (Tick 0)
-
-    private func applyEffectTick0(channel: Int, effect: UInt8, param: UInt8) {
-        switch effect {
-        case 0x00: // Arpeggio (handled per tick)
-            if param != 0 { voices[channel].lastVibrato = param /* repurposed via lastArpeggio elsewhere */ }
-        case 0x01: // Porta up
-            if param != 0 { voices[channel].lastPortaUp = param }
-        case 0x02: // Porta down
-            if param != 0 { voices[channel].lastPortaDown = param }
-        case 0x03: // Tone porta
-            if param != 0 { voices[channel].lastTonePorta = param }
-        case 0x04: // Vibrato
-            let hi = (param >> 4) & 0x0F
-            let lo = param & 0x0F
-            if hi != 0 { voices[channel].vibratoSpeed = Int(hi) }
-            if lo != 0 { voices[channel].vibratoDepth = Int(lo) }
-            voices[channel].vibratoActive = true
-        case 0x05: // Tone porta + volume slide
-            if param != 0 { voices[channel].lastVolumeSlide = param }
-        case 0x06: // Vibrato + volume slide
-            if param != 0 { voices[channel].lastVolumeSlide = param }
-            voices[channel].vibratoActive = true
-        case 0x07: // Tremolo
-            let hi = (param >> 4) & 0x0F
-            let lo = param & 0x0F
-            if hi != 0 { voices[channel].tremoloSpeed = Int(hi) }
-            if lo != 0 { voices[channel].tremoloDepth = Int(lo) }
-            voices[channel].tremoloActive = true
-        case 0x08: // Set panning
-            voices[channel].panning = Int(param)
-        case 0x09: // Sample offset
-            if param != 0 { voices[channel].lastSampleOffset = param }
-            voices[channel].samplePos = Double(Int(voices[channel].lastSampleOffset) * 256)
-            if Int(voices[channel].samplePos) >= voices[channel].sample.count {
-                voices[channel].active = false
-            }
-        case 0x0A: // Volume slide
-            if param != 0 { voices[channel].lastVolumeSlide = param }
-        case 0x0B: // Position jump
-            orderIndex = Int(param)
-            row = 0
-            rowJumped = true
-        case 0x0C: // Set volume
-            voices[channel].volume = Int(min(64, param))
-        case 0x0D: // Pattern break
-            let target = Int((param >> 4) * 10 + (param & 0x0F))
-            orderIndex += 1
-            row = max(0, target)
-            rowJumped = true
-        case 0x0E: // Extended
-            handleETick0(channel: channel, param: param)
-        case 0x0F: // Set speed / tempo
-            if param > 0 {
-                if param < 0x20 { speed = Int(param) }
-                else            { tempo = Int(param) }
-            }
-        case 0x10: // G — global volume
-            globalVolume = Int(min(64, param))
-        case 0x11: // H — global volume slide
-            if param != 0 { voices[channel].lastGlobalSlide = param }
-        case 0x14: // K — key off
-            voices[channel].keyOff = true
-        case 0x15: // L — set envelope position
-            voices[channel].volEnvFrame = Int(param)
-            voices[channel].panEnvFrame = Int(param)
-        case 0x19: // P — panning slide
-            if param != 0 { voices[channel].lastPanSlide = param }
-        case 0x1B: // R — multi retrig
-            if param != 0 { voices[channel].lastRetrigger = param }
-        case 0x1D: // T — tremor
-            if param != 0 { voices[channel].lastTremor = param }
-            voices[channel].tremorActive = true
-        case 0x21: // X — extra fine porta
-            let hi = (param >> 4) & 0x0F
-            let lo = param & 0x0F
-            if hi == 1 {
-                if lo != 0 { voices[channel].lastExtraFineUp = lo }
-                voices[channel].period = max(1, voices[channel].period - Double(voices[channel].lastExtraFineUp))
-                voices[channel].basePeriod = voices[channel].period
-            } else if hi == 2 {
-                if lo != 0 { voices[channel].lastExtraFineDown = lo }
-                voices[channel].period += Double(voices[channel].lastExtraFineDown)
-                voices[channel].basePeriod = voices[channel].period
-            }
-        default:
-            break
-        }
-    }
-
-    private func handleETick0(channel: Int, param: UInt8) {
-        let cmd = (param >> 4) & 0x0F
-        let v   = param & 0x0F
-        switch cmd {
-        case 0x1: // Fine porta up
-            if v != 0 { voices[channel].lastFineSlideUp = v }
-            voices[channel].period = max(1, voices[channel].period - Double(voices[channel].lastFineSlideUp) * 4)
-            voices[channel].basePeriod = voices[channel].period
-        case 0x2: // Fine porta down
-            if v != 0 { voices[channel].lastFineSlideDown = v }
-            voices[channel].period += Double(voices[channel].lastFineSlideDown) * 4
-            voices[channel].basePeriod = voices[channel].period
-        case 0x3: // Glissando control
-            // E30 = off (smooth slide, the default); E31 = on
-            // (tone-porta snaps to semitone boundaries). Any non-
-            // zero param enables it.
-            voices[channel].glissandoActive = (v & 0x0F) != 0
-        case 0x4: // Vibrato waveform
-            voices[channel].vibratoWaveform = v & 0x03
-        case 0x5: // Set finetune (modifies period base, not c2spd)
-            break
-        case 0x6: // Pattern loop
-            handleSBPatternLoop(value: Int(v))
-        case 0x7: // Tremolo waveform
-            voices[channel].tremoloWaveform = v & 0x03
-        case 0x9: // Retrigger
-            // E9x retriggers every (v) ticks; handled in applyTickEffects.
-            voices[channel].lastRetrigger = v
-        case 0xA: // Fine volume slide up
-            voices[channel].volume = min(64, voices[channel].volume + Int(v))
-        case 0xB: // Fine volume slide down
-            voices[channel].volume = max(0, voices[channel].volume - Int(v))
-        case 0xC: // Note cut
-            if v == 0 { voices[channel].volume = 0 }
-        case 0xD: // Note delay (already handled in applyTriggerCell)
-            break
-        case 0xE: // Pattern delay
-            pendingRowRepeats = Int(v)
-        default:
-            break
-        }
-    }
-
-    private func handleSBPatternLoop(value: Int) {
-        if value == 0 {
-            patternLoopRow = row
-        } else {
-            if patternLoopCount == 0 { patternLoopCount = value }
-            else                     { patternLoopCount -= 1 }
-            if patternLoopCount > 0 {
-                row = max(0, patternLoopRow)
-                rowJumped = true
-            }
-        }
-    }
-
-    // MARK: - Effects (tick > 0)
-
-    private func applyTickEffects() {
-        guard patternIndex < file.patterns.count else { return }
-        let pattern = file.patterns[patternIndex]
-        guard row < pattern.rows.count else { return }
-        let cells = pattern.rows[row]
-
-        for ch in 0..<min(cells.count, voices.count) {
-            let cell = cells[ch]
-            // Volume column slide commands fire each tick.
-            tickVolumeColumn(channel: ch, byte: cell.volume)
-
-            switch cell.effect {
-            case 0x00:
-                if cell.param != 0 {
-                    applyArpeggio(channel: ch, param: cell.param)
-                }
-            case 0x01:
-                voices[ch].period = max(1, voices[ch].period - Double(voices[ch].lastPortaUp) * 4)
-                voices[ch].basePeriod = voices[ch].period
-            case 0x02:
-                voices[ch].period += Double(voices[ch].lastPortaDown) * 4
-                voices[ch].basePeriod = voices[ch].period
-            case 0x03:
-                applyTonePorta(channel: ch)
-            case 0x04:
-                if voices[ch].vibratoActive { /* effective state recomputed below */ }
-            case 0x05:
-                applyTonePorta(channel: ch)
-                applyVolumeSlide(channel: ch, info: voices[ch].lastVolumeSlide)
-            case 0x06:
-                applyVolumeSlide(channel: ch, info: voices[ch].lastVolumeSlide)
-            case 0x07:
-                break
-            case 0x0A:
-                applyVolumeSlide(channel: ch, info: voices[ch].lastVolumeSlide)
-            case 0x0E:
-                let cmd = (cell.param >> 4) & 0x0F
-                let v   = cell.param & 0x0F
-                // ECx note cut: zero the channel volume on tick v.
-                // Conventional FT2 fires the cut on the EXACT tick
-                // requested (so EC1 cuts on tick 1, not tick 0 or
-                // earlier). EC0 cuts immediately on tick 0.
-                if cmd == 0xC && Int(v) == tick {
-                    voices[ch].volume = 0
-                }
-                // E9x retrigger: fire on ticks where
-                // `tick % v == 0 && tick > 0` so the note isn't
-                // re-triggered on its own row-start tick (the
-                // original row trigger has already played it).
-                if cmd == 0x9 && v > 0 && tick > 0 && tick % Int(v) == 0 {
-                    voices[ch].samplePos = 0
-                    voices[ch].active = !voices[ch].sample.isEmpty
-                    voices[ch].autoVibFrame = 0
-                    voices[ch].frozenAutoVibSweep = nil
-                }
-                // EDx note delay: trigger the row's pending note
-                // when `tick == v`. The row's actual note was
-                // queued in `pendingNote` rather than played, so we
-                // fire it here. v == 0 falls through (already played
-                // on tick 0).
-                if cmd == 0xD && Int(v) == tick && v > 0 {
-                    if voices[ch].pendingNote != 0 {
-                        triggerNote(channel: ch,
-                                    note: voices[ch].pendingNote,
-                                    instrument: voices[ch].pendingInstrument)
-                        voices[ch].pendingNote = 0
-                        voices[ch].pendingInstrument = 0
-                    }
-                }
-            case 0x11: // H — global volume slide
-                let info = voices[ch].lastGlobalSlide
-                let hi = Int((info >> 4) & 0x0F)
-                let lo = Int(info & 0x0F)
-                if hi != 0 { globalVolume = min(64, globalVolume + hi) }
-                else if lo != 0 { globalVolume = max(0, globalVolume - lo) }
-            case 0x19: // P — panning slide
-                let info = voices[ch].lastPanSlide
-                let hi = Int((info >> 4) & 0x0F)
-                let lo = Int(info & 0x0F)
-                if hi != 0 { voices[ch].panning = min(255, voices[ch].panning + hi) }
-                else if lo != 0 { voices[ch].panning = max(0, voices[ch].panning - lo) }
-            case 0x1B: // R — multi retrigger
-                // Param is `0xXY` — X selects a volume-change op
-                // applied each retrigger, Y is the tick interval.
-                // The retrigger restarts the sample position and
-                // the auto-vibrato sweep counter; the volume change
-                // happens on every retrigger after the first.
-                let info = voices[ch].lastRetrigger
-                let xx = Int((info >> 4) & 0x0F)
-                let yy = Int(info & 0x0F)
-                if yy > 0 && tick % yy == 0 {
-                    voices[ch].samplePos = 0
-                    voices[ch].active = !voices[ch].sample.isEmpty
-                    voices[ch].autoVibFrame = 0
-                    voices[ch].frozenAutoVibSweep = nil
-                    if tick > 0 {
-                        voices[ch].volume = applyRetriggerVolumeOp(
-                            voices[ch].volume,
-                            op: xx
-                        )
-                    }
-                }
-            case 0x1D: // T — tremor
-                advanceTremor(channel: ch)
-            default:
-                break
-            }
-        }
-    }
-
-    private func tickVolumeColumn(channel: Int, byte: UInt8) {
-        let cmd = XMVolumeCommand(byte: byte)
-        switch cmd {
-        case .slideDown(let v):
-            voices[channel].volume = max(0, voices[channel].volume - Int(v))
-        case .slideUp(let v):
-            voices[channel].volume = min(64, voices[channel].volume + Int(v))
-        case .panSlideLeft(let v):
-            voices[channel].panning = max(0, voices[channel].panning - Int(v))
-        case .panSlideRight(let v):
-            voices[channel].panning = min(255, voices[channel].panning + Int(v))
-        case .tonePorta:
-            applyTonePorta(channel: channel)
-        default:
-            break
-        }
-    }
-
-    private func applyArpeggio(channel: Int, param: UInt8) {
-        let phase = tick % 3
-        let offset: Int
-        switch phase {
-        case 1: offset = Int(param >> 4)
-        case 2: offset = Int(param & 0x0F)
-        default: offset = 0
-        }
-        if offset == 0 {
-            voices[channel].period = voices[channel].basePeriod
-        } else {
-            // Reduce period by `offset` semitones (higher pitch).
-            voices[channel].period = voices[channel].basePeriod - Double(offset * 64)
-        }
-    }
-
-    private func applyVolumeSlide(channel: Int, info: UInt8) {
-        let hi = Int((info >> 4) & 0x0F)
-        let lo = Int(info & 0x0F)
-        if hi != 0 { voices[channel].volume = min(64, voices[channel].volume + hi) }
-        else if lo != 0 { voices[channel].volume = max(0, voices[channel].volume - lo) }
-    }
-
-    private func applyTonePorta(channel: Int) {
-        let rate = Int(voices[channel].lastTonePorta) * 4
-        guard rate > 0 else { return }
-        let target = voices[channel].tonePortaTarget
-        var p = voices[channel].period
-        if p < target {
-            p = min(target, p + Double(rate))
-        } else if p > target {
-            p = max(target, p - Double(rate))
-        }
-        // Glissando control (E3x): snap the sliding period to its
-        // nearest whole-semitone period so the slide steps rather
-        // than glides. Only affects the active-display period; the
-        // tone-porta target still steers the direction.
-        if voices[channel].glissandoActive {
-            p = snapPeriodToSemitone(p, finetune: 0)
-        }
-        voices[channel].period = p
-        voices[channel].basePeriod = p
-    }
-
-    /// Round `period` to the nearest whole-semitone period in the
-    /// current frequency table. Used by the E3x glissando-control
-    /// flag — when set, tone-porta lands on semitone boundaries
-    /// rather than gliding continuously through them.
-    private func snapPeriodToSemitone(_ period: Double, finetune: Int) -> Double {
-        switch file.frequencyTable {
-        case .linear:
-            // Linear period = 7680 - note*64 - finetune/2 → invert.
-            let approxNote = (7680.0 - period - Double(finetune) / 2.0) / 64.0
-            let nearest = Int(approxNote.rounded())
-            return computePeriod(note: nearest, finetune: finetune)
-        case .amiga:
-            // Amiga periods don't share a simple inverse, so walk
-            // a handful of candidate notes and pick the closest.
-            var bestNote = 0
-            var bestDistance = Double.infinity
-            for n in 0..<120 {
-                let candidate = computePeriod(note: n, finetune: finetune)
-                let d = abs(candidate - period)
-                if d < bestDistance { bestDistance = d; bestNote = n }
-            }
-            return computePeriod(note: bestNote, finetune: finetune)
-        }
-    }
-
-    /// Apply the per-retrigger volume change selected by the high
-    /// nibble of an Rxy parameter. Sixteen ops in total — eight
-    /// linear deltas, two ratios in each direction, and three
-    /// no-ops on the boundary values. Clamps to 0..64.
-    private func applyRetriggerVolumeOp(_ volume: Int, op: Int) -> Int {
-        switch op {
-        case 0, 8: return volume
-        case 1: return max(0, volume - 1)
-        case 2: return max(0, volume - 2)
-        case 3: return max(0, volume - 4)
-        case 4: return max(0, volume - 8)
-        case 5: return max(0, volume - 16)
-        case 6: return max(0, (volume * 2) / 3)
-        case 7: return max(0, volume / 2)
-        case 9: return min(64, volume + 1)
-        case 0xA: return min(64, volume + 2)
-        case 0xB: return min(64, volume + 4)
-        case 0xC: return min(64, volume + 8)
-        case 0xD: return min(64, volume + 16)
-        case 0xE: return min(64, (volume * 3) / 2)
-        case 0xF: return min(64, volume * 2)
-        default: return volume
-        }
-    }
-
-    private func advanceTremor(channel: Int) {
-        let info = voices[channel].lastTremor
-        let onTicks = Int(info >> 4) + 1
-        let offTicks = Int(info & 0x0F) + 1
-        voices[channel].tremorCount += 1
-        let cycle = onTicks + offTicks
-        let phase = voices[channel].tremorCount % cycle
-        voices[channel].tremorOn = phase < onTicks
-    }
-
-    // MARK: - Envelopes + fadeout
-
-    private func advanceEnvelopes() {
-        for c in 0..<voices.count where voices[c].active {
-            let insIdx = voices[c].instrumentIndex
-            guard insIdx >= 0, insIdx < file.instruments.count else { continue }
-            let ins = file.instruments[insIdx]
-            if voices[c].volEnvOn {
-                voices[c].volEnvFrame += 1
-            }
-            if voices[c].panEnvOn {
-                voices[c].panEnvFrame += 1
-            }
-            // Fade-out runs after key-off when the volume envelope
-            // is enabled (FT2 behaviour per spec).
-            if voices[c].keyOff && voices[c].volEnvOn {
-                voices[c].fadeoutVol -= Int(ins.volumeFadeout)
-                if voices[c].fadeoutVol <= 0 {
-                    voices[c].fadeoutVol = 0
-                    voices[c].active = false
-                }
-            }
-        }
-    }
-
-    // MARK: - Effective-state recompute
-
-    private func recomputeEffectiveState() {
-        for c in 0..<voices.count where voices[c].active {
-            // Vibrato modulates period (lowering = higher pitch).
-            var period = voices[c].period
-            if voices[c].vibratoActive && voices[c].vibratoDepth > 0 {
-                let w = waveformSample(pos: voices[c].vibratoPos,
-                                       waveform: voices[c].vibratoWaveform)
-                period -= Double(w * voices[c].vibratoDepth) / 16.0
-                voices[c].vibratoPos = (voices[c].vibratoPos + voices[c].vibratoSpeed) & 0x3F
-            }
-
-            // Auto-vibrato — instrument-level LFO that runs the
-            // whole time a note is held. The depth ramps up over
-            // `autoVibrato.sweep` frames; once the note keys off,
-            // we freeze the sweep multiplier so the depth doesn't
-            // keep growing through the fade-out (FT2 quirk).
-            let avInsIdx = voices[c].instrumentIndex
-            if avInsIdx >= 0, avInsIdx < file.instruments.count {
-                let ins = file.instruments[avInsIdx]
-                let av = ins.autoVibrato
-                if av.rate > 0 && av.depth > 0 {
-                    let sweep = Int(av.sweep)
-                    let frame = voices[c].autoVibFrame
-                    let liveMult: Double = sweep > 0
-                        ? min(1.0, Double(frame) / Double(sweep))
-                        : 1.0
-                    let mult: Double
-                    if voices[c].keyOff {
-                        if voices[c].frozenAutoVibSweep == nil {
-                            voices[c].frozenAutoVibSweep = liveMult
-                        }
-                        mult = voices[c].frozenAutoVibSweep ?? liveMult
-                    } else {
-                        mult = liveMult
-                    }
-                    let pos = (frame * Int(av.rate) / 4) & 0x3F
-                    let w = waveformSample(pos: pos, waveform: av.type)
-                    period -= Double(w) * Double(av.depth) * mult / 64.0
-                    voices[c].autoVibFrame &+= 1
-                }
-            }
-
-            period = max(1, period)
-            let freq = frequency(forPeriod: period)
-            voices[c].effectiveStep = freq / sampleRate
-
-            let insIdx = voices[c].instrumentIndex
-            let ins: XMInstrument? = (insIdx >= 0 && insIdx < file.instruments.count)
-                ? file.instruments[insIdx] : nil
-
-            // Volume: channel × envelope × fadeout × tremolo × tremor.
-            var vol = Double(voices[c].volume) / 64.0
-            if let ins, voices[c].volEnvOn {
-                vol *= envelopeValue(envelope: ins.volumeEnvelope, frame: voices[c].volEnvFrame) / 64.0
-            }
-            if voices[c].keyOff && voices[c].volEnvOn {
-                vol *= Double(voices[c].fadeoutVol) / 65536.0
-            } else if voices[c].keyOff && !voices[c].volEnvOn {
-                vol = 0
+                if cell.instrument > 0 && instrumentValid { resetToSampleDefaults(channel: c) }
+            } else if !instrumentValid {
                 voices[c].active = false
+            } else {
+                playNote(channel: c, note: note, cell: cell)
             }
-            if voices[c].tremoloActive && voices[c].tremoloDepth > 0 {
-                let w = waveformSample(pos: voices[c].tremoloPos,
-                                       waveform: voices[c].tremoloWaveform)
-                vol += Double(w * voices[c].tremoloDepth) / 64.0 / 64.0
-                voices[c].tremoloPos = (voices[c].tremoloPos + voices[c].tremoloSpeed) & 0x3F
-            }
-            if voices[c].tremorActive && !voices[c].tremorOn {
-                vol = 0
-            }
-            voices[c].effectiveVolume = max(0, min(1, vol))
+        } else if cell.instrument > 0 && instrumentValid {
+            resetToSampleDefaults(channel: c)
+        }
 
-            // Pan: channel pan tempered by panning envelope.
-            var pan = Double(voices[c].panning - 128) / 128.0
-            if let ins, voices[c].panEnvOn {
-                let env = envelopeValue(envelope: ins.panningEnvelope, frame: voices[c].panEnvFrame)
-                // 0..64 envelope value; 32 = centre.
-                pan += (env - 32.0) / 32.0 * (1.0 - abs(pan))
-            }
-            voices[c].effectivePan = Float(max(-1, min(1, pan)))
+        switch XMVolumeCommand(byte: cell.volume) {
+        case .setVolume(let v): voices[c].volume = Int(v)
+        case .fineSlideDown(let v): voices[c].volume = max(0, voices[c].volume - Int(v))
+        case .fineSlideUp(let v): voices[c].volume = min(64, voices[c].volume + Int(v))
+        case .setVibratoSpeed(let v): if v != 0 { voices[c].vibratoSpeed = Int(v) * 4 }
+        case .vibrato(let v): if v != 0 { voices[c].vibratoDepth = Int(v) }
+        case .setPanning(let v): voices[c].panning = Int(v)
+        default: break
         }
     }
 
-    private func envelopeValue(envelope: XMInstrument.Envelope, frame: Int) -> Double {
-        guard !envelope.points.isEmpty else { return 64.0 }
-        let f = frame
-        if f <= Int(envelope.points[0].frame) {
-            return Double(envelope.points[0].value)
+    private func playNote(channel c: Int, note: Int, cell: XMPattern.Cell) {
+        guard voices[c].instrument > 0 else { return }
+        let ins = file.instruments[voices[c].instrument - 1]
+        let si = Int(ins.sampleMap[note - 1])
+        guard si < ins.samples.count, !ins.samples[si].pcm.isEmpty else {
+            voices[c].active = false
+            return
         }
-        for i in 0..<(envelope.points.count - 1) {
-            let a = envelope.points[i]
-            let b = envelope.points[i + 1]
-            if f < Int(b.frame) {
-                let span = Double(b.frame - a.frame)
-                guard span > 0 else { return Double(a.value) }
-                let dy = Double(b.value) - Double(a.value)
-                let dx = Double(f - Int(a.frame))
-                return Double(a.value) + dy * dx / span
+        let smp = ins.samples[si]
+        var finetune = Int(smp.finetune)
+        if cell.effect == 0x0E && cell.param >> 4 == 0x5 {
+            finetune = Int(cell.param & 0x0F) * 16 - 128
+        }
+        let realNote = note - 1 + Int(smp.relativeNote)
+        guard (0...118).contains(realNote) else { return }
+
+        voices[c].note = note
+        voices[c].sampleIndex = si
+        voices[c].pcm = smp.pcm
+        voices[c].loopStart = smp.loopBegin
+        voices[c].loopEnd = smp.loopEnd
+        voices[c].loopMode = smp.loopMode
+        voices[c].relativeNote = Int(smp.relativeNote)
+        voices[c].finetune = finetune
+        let period = periodFor(note: realNote, finetune: finetune)
+        voices[c].period = period
+        voices[c].outPeriod = period
+        voices[c].targetPeriod = period
+        voices[c].pos = 0
+        voices[c].forward = true
+        voices[c].active = true
+        if voices[c].waveControl & 0x04 == 0 { voices[c].vibratoPos = 0 }
+        if voices[c].waveControl & 0x40 == 0 { voices[c].tremoloPos = 0 }
+        voices[c].retrigCount = 0
+        voices[c].tremorPos = 0
+
+        if cell.effect == 0x09 {
+            let offset = Int(voices[c].memOffset) * 256
+            if offset >= smp.pcm.count {
+                voices[c].active = false
+            } else {
+                voices[c].pos = Double(offset)
             }
         }
-        return Double(envelope.points.last!.value)
-    }
-
-    // MARK: - Waveform LUTs
-
-    private static let sineTable: [Int] = (0..<64).map {
-        Int((sin(Double($0) * .pi / 32.0) * 64.0).rounded())
-    }
-    private static let rampDownTable: [Int] = (0..<64).map { 64 - $0 * 2 - 1 }
-    private static let squareTable: [Int] = (0..<64).map { $0 < 32 ? 64 : -64 }
-
-    private func waveformSample(pos: Int, waveform: UInt8) -> Int {
-        let i = pos & 0x3F
-        switch waveform & 0x03 {
-        case 0: return Self.sineTable[i]
-        case 1: return Self.rampDownTable[i]
-        case 2: return Self.squareTable[i]
-        default: return Self.sineTable[i]
+        if cell.instrument > 0 {
+            voices[c].volume = Int(smp.volume)
+            voices[c].panning = Int(smp.panning)
+            triggerInstrument(channel: c)
         }
+    }
+
+    /// "OldVol": reset volume and panning to the current sample's
+    /// defaults and retrigger the envelopes, without restarting the
+    /// sample.
+    private func resetToSampleDefaults(channel c: Int) {
+        guard voices[c].instrument > 0 else { return }
+        let ins = file.instruments[voices[c].instrument - 1]
+        let mapped = voices[c].note > 0 ? Int(ins.sampleMap[voices[c].note - 1]) : voices[c].sampleIndex
+        if mapped >= 0 && mapped < ins.samples.count {
+            voices[c].volume = Int(ins.samples[mapped].volume)
+            voices[c].panning = Int(ins.samples[mapped].panning)
+        }
+        triggerInstrument(channel: c)
+    }
+
+    /// Envelope / fade-out / auto-vibrato reset.
+    private func triggerInstrument(channel c: Int) {
+        voices[c].keyOff = false
+        voices[c].fadeout = 32768
+        voices[c].volEnvFrame = 0
+        voices[c].panEnvFrame = 0
+        voices[c].autoVibPos = 0
+        guard voices[c].instrument > 0 else { return }
+        let av = file.instruments[voices[c].instrument - 1].autoVibrato
+        if av.sweep > 0 {
+            voices[c].autoVibAmp = 0
+            voices[c].autoVibSweep = (Int(av.depth) << 8) / Int(av.sweep)
+        } else {
+            voices[c].autoVibAmp = Int(av.depth) << 8
+            voices[c].autoVibSweep = 0
+        }
+    }
+
+    private func keyOff(channel c: Int) {
+        voices[c].keyOff = true
+        if let ins = currentInstrument(c), !ins.volumeEnvelope.enabled {
+            voices[c].volume = 0
+        }
+    }
+
+    private func currentInstrument(_ c: Int) -> XMInstrument? {
+        let i = voices[c].instrument
+        return i > 0 && i <= file.instruments.count ? file.instruments[i - 1] : nil
+    }
+
+    private func effectTick0(channel c: Int, cell: XMPattern.Cell) {
+        let p = cell.param
+        let hi = p >> 4
+        let lo = p & 0x0F
+        switch cell.effect {
+        case 0x01: if p != 0 { voices[c].memPortaUp = p }
+        case 0x02: if p != 0 { voices[c].memPortaDown = p }
+        case 0x04:
+            if hi != 0 { voices[c].vibratoSpeed = Int(hi) * 4 }
+            if lo != 0 { voices[c].vibratoDepth = Int(lo) }
+        case 0x05, 0x06, 0x0A:
+            if p != 0 { voices[c].memVolSlide = p }
+        case 0x07:
+            if hi != 0 { voices[c].tremoloSpeed = Int(hi) * 4 }
+            if lo != 0 { voices[c].tremoloDepth = Int(lo) }
+        case 0x08:
+            voices[c].panning = Int(p)
+        case 0x0B:
+            jumpTarget = Int(p)
+            breakPos = 0
+            posJumpFlag = true
+        case 0x0C:
+            voices[c].volume = min(64, Int(p))
+        case 0x0D:
+            let target = Int(hi) * 10 + Int(lo)
+            breakPos = target <= 63 ? target : 0
+            posJumpFlag = true
+        case 0x0E:
+            extendedTick0(channel: c, sub: hi, value: lo)
+        case 0x0F:
+            if p == 0 { break }
+            if p < 0x20 { speed = Int(p) } else { bpm = Int(p) }
+        case 0x10:
+            globalVolume = min(64, Int(p))
+        case 0x11:
+            if p != 0 { voices[c].memGlobalSlide = p }
+        case 0x14:
+            if p == 0 { keyOff(channel: c) }
+        case 0x15:
+            setEnvelopePosition(channel: c, frame: Int(p))
+        case 0x19:
+            if p != 0 { voices[c].memPanSlide = p }
+        case 0x1B:
+            if hi != 0 { voices[c].retrigVolume = Int(hi) }
+            if lo != 0 { voices[c].retrigSpeed = Int(lo) }
+        case 0x1D:
+            if p != 0 { voices[c].memTremor = p }
+        case 0x21:
+            if hi == 1 {
+                if lo != 0 { voices[c].memExtraFineUp = lo }
+                slide(channel: c, by: -Double(voices[c].memExtraFineUp))
+            } else if hi == 2 {
+                if lo != 0 { voices[c].memExtraFineDown = lo }
+                slide(channel: c, by: Double(voices[c].memExtraFineDown))
+            }
+        default:
+            // 0 arpeggio, 3 tone porta and 9 offset work elsewhere.
+            break
+        }
+    }
+
+    private func extendedTick0(channel c: Int, sub: UInt8, value v: UInt8) {
+        switch sub {
+        case 0x1:
+            if v != 0 { voices[c].memFinePortaUp = v }
+            slide(channel: c, by: -Double(Int(voices[c].memFinePortaUp) * 4))
+        case 0x2:
+            if v != 0 { voices[c].memFinePortaDown = v }
+            slide(channel: c, by: Double(Int(voices[c].memFinePortaDown) * 4))
+        case 0x3:
+            voices[c].glissando = v != 0
+        case 0x4:
+            voices[c].waveControl = (voices[c].waveControl & 0xF0) | Int(v)
+        case 0x6:
+            patternLoop(channel: c, value: Int(v))
+        case 0x7:
+            voices[c].waveControl = (voices[c].waveControl & 0x0F) | Int(v) << 4
+        case 0xA:
+            if v != 0 { voices[c].memFineVolUp = v }
+            voices[c].volume = min(64, voices[c].volume + Int(voices[c].memFineVolUp))
+        case 0xB:
+            if v != 0 { voices[c].memFineVolDown = v }
+            voices[c].volume = max(0, voices[c].volume - Int(voices[c].memFineVolDown))
+        case 0xC:
+            if v == 0 { voices[c].volume = 0 }
+        case 0xE:
+            if patternDelay == 0 { patternDelay = Int(v) }
+        default:
+            // E0x (filter) and E8x are unused in FT2; E5x applies with
+            // the note; E9x, ECx (x > 0) and EDx run on later ticks.
+            break
+        }
+    }
+
+    private func patternLoop(channel c: Int, value: Int) {
+        if value == 0 {
+            voices[c].loopRow = row
+        } else if voices[c].loopCount == 0 {
+            voices[c].loopCount = value
+            breakPos = voices[c].loopRow
+            breakFlag = true
+        } else {
+            voices[c].loopCount -= 1
+            if voices[c].loopCount > 0 {
+                breakPos = voices[c].loopRow
+                breakFlag = true
+            }
+        }
+    }
+
+    private func setEnvelopePosition(channel c: Int, frame: Int) {
+        guard let ins = currentInstrument(c) else { return }
+        if ins.volumeEnvelope.enabled { voices[c].volEnvFrame = frame }
+        // FT2 bug: the panning envelope position is only set when the
+        // volume envelope has its sustain flag.
+        if ins.volumeEnvelope.sustainEnabled { voices[c].panEnvFrame = frame }
+    }
+
+    // MARK: - Ticks > 0
+
+    private func processTickN() {
+        for c in 0..<voices.count {
+            if voices[c].delayTick == tick, let cell = voices[c].delayedCell {
+                voices[c].delayedCell = nil
+                voices[c].delayTick = -1
+                triggerCell(channel: c, cell: cell)
+            }
+            let cell = voices[c].cell
+            let volumeCommand = XMVolumeCommand(byte: cell.volume)
+            let p = cell.param
+
+            // 1. Changes to the underlying period / volume / panning
+            //    (volume column first, as in FT2).
+            var portaActive = false
+            switch volumeCommand {
+            case .slideDown(let v): voices[c].volume = max(0, voices[c].volume - Int(v))
+            case .slideUp(let v): voices[c].volume = min(64, voices[c].volume + Int(v))
+            case .panSlideLeft(let v): voices[c].panning = max(0, voices[c].panning - Int(v))
+            case .panSlideRight(let v): voices[c].panning = min(255, voices[c].panning + Int(v))
+            case .tonePorta:
+                tonePorta(channel: c)
+                portaActive = true
+            default: break
+            }
+            switch cell.effect {
+            case 0x01: slide(channel: c, by: -Double(Int(voices[c].memPortaUp) * 4))
+            case 0x02: slide(channel: c, by: Double(Int(voices[c].memPortaDown) * 4))
+            case 0x03:
+                tonePorta(channel: c)
+                portaActive = true
+            case 0x05:
+                tonePorta(channel: c)
+                portaActive = true
+                volumeSlide(channel: c)
+            case 0x06, 0x0A: volumeSlide(channel: c)
+            case 0x0E: extendedTickN(channel: c, sub: p >> 4, value: Int(p & 0x0F))
+            case 0x11:
+                let m = voices[c].memGlobalSlide
+                if m >> 4 == 0 { globalVolume = max(0, globalVolume - Int(m & 0x0F)) }
+                else { globalVolume = min(64, globalVolume + Int(m >> 4)) }
+            case 0x14:
+                if Int(p) == tick { keyOff(channel: c) }
+            case 0x19:
+                let m = voices[c].memPanSlide
+                if m >> 4 == 0 { voices[c].panning = max(0, voices[c].panning - Int(m & 0x0F)) }
+                else { voices[c].panning = min(255, voices[c].panning + Int(m >> 4)) }
+            case 0x1B: multiRetrig(channel: c)
+            default: break
+            }
+
+            // 2. Outputs start from the underlying values.
+            voices[c].outPeriod = portaActive && voices[c].glissando && voices[c].period > 0
+                ? snapToSemitone(voices[c].period, channel: c) : voices[c].period
+            voices[c].outVolume = voices[c].volume
+
+            // 3. Overlays.
+            if case .vibrato = volumeCommand { vibrato(channel: c) }
+            switch cell.effect {
+            case 0x00 where p != 0: arpeggio(channel: c, param: p)
+            case 0x04, 0x06: vibrato(channel: c)
+            case 0x07: tremolo(channel: c)
+            case 0x1D: tremor(channel: c)
+            default: break
+            }
+        }
+    }
+
+    private func extendedTickN(channel c: Int, sub: UInt8, value: Int) {
+        switch sub {
+        case 0x9:
+            if value > 0 && tick % value == 0 {
+                voices[c].pos = 0
+                voices[c].forward = true
+                voices[c].active = !voices[c].pcm.isEmpty
+                triggerInstrument(channel: c)
+            }
+        case 0xC:
+            if value == tick { voices[c].volume = 0 }
+        default:
+            break
+        }
+    }
+
+    private func slide(channel c: Int, by delta: Double) {
+        guard voices[c].period > 0 else { return }
+        voices[c].period = min(Self.periodRange.upperBound,
+                               max(Self.periodRange.lowerBound, voices[c].period + delta))
+    }
+
+    private func volumeSlide(channel c: Int) {
+        let m = voices[c].memVolSlide
+        if m >> 4 == 0 {
+            voices[c].volume = max(0, voices[c].volume - Int(m & 0x0F))
+        } else {
+            voices[c].volume = min(64, voices[c].volume + Int(m >> 4))
+        }
+    }
+
+    private func tonePorta(channel c: Int) {
+        let target = voices[c].targetPeriod
+        let speed = Double(voices[c].portaSpeed)
+        guard voices[c].period > 0, target > 0, speed > 0 else { return }
+        if voices[c].period > target {
+            voices[c].period = max(target, voices[c].period - speed)
+        } else if voices[c].period < target {
+            voices[c].period = min(target, voices[c].period + speed)
+        }
+    }
+
+    /// FT2 `vibrato2`: 8-bit position, 32-step half table, depth >> 5.
+    private func vibrato(channel c: Int) {
+        let pos = voices[c].vibratoPos
+        var amount = (pos >> 2) & 0x1F
+        switch voices[c].waveControl & 0x03 {
+        case 0: amount = Self.vibratoTable[amount]
+        case 1:
+            amount <<= 3
+            if pos >= 128 { amount = 255 - amount }
+        default: amount = 255
+        }
+        let delta = Double((amount * voices[c].vibratoDepth) >> 5)
+        voices[c].outPeriod = pos < 128 ? voices[c].outPeriod + delta : voices[c].outPeriod - delta
+        voices[c].vibratoPos = (pos + voices[c].vibratoSpeed) & 0xFF
+    }
+
+    /// FT2 tremolo (the ramp waveform reads the vibrato position, an
+    /// FT2 bug reproduced on purpose).
+    private func tremolo(channel c: Int) {
+        let pos = voices[c].tremoloPos
+        var amount = (pos >> 2) & 0x1F
+        switch (voices[c].waveControl >> 4) & 0x03 {
+        case 0: amount = Self.vibratoTable[amount]
+        case 1:
+            amount <<= 3
+            if voices[c].vibratoPos >= 128 { amount = 255 - amount }
+        default: amount = 255
+        }
+        let delta = (amount * voices[c].tremoloDepth) >> 6
+        voices[c].outVolume = pos < 128 ? min(64, voices[c].volume + delta)
+                                        : max(0, voices[c].volume - delta)
+        voices[c].tremoloPos = (pos + voices[c].tremoloSpeed) & 0xFF
+    }
+
+    /// FT2 tremor: x+1 ticks on, y+1 ticks off, state kept across rows.
+    private func tremor(channel c: Int) {
+        let param = voices[c].memTremor
+        var sign = voices[c].tremorPos & 0x80
+        var data = Int(voices[c].tremorPos & 0x7F) - 1
+        if data < 0 {
+            if sign == 0x80 {
+                sign = 0
+                data = Int(param & 0x0F)
+            } else {
+                sign = 0x80
+                data = Int(param >> 4)
+            }
+        }
+        voices[c].tremorPos = sign | UInt8(data & 0x7F)
+        voices[c].outVolume = sign == 0x80 ? voices[c].volume : 0
+    }
+
+    private func multiRetrig(channel c: Int) {
+        let count = voices[c].retrigCount + 1
+        if count < voices[c].retrigSpeed {
+            voices[c].retrigCount = count
+            return
+        }
+        voices[c].retrigCount = 0
+        var vol = voices[c].volume
+        switch voices[c].retrigVolume {
+        case 0x1: vol -= 1
+        case 0x2: vol -= 2
+        case 0x3: vol -= 4
+        case 0x4: vol -= 8
+        case 0x5: vol -= 16
+        case 0x6: vol = vol * 2 / 3
+        case 0x7: vol >>= 1
+        case 0x9: vol += 1
+        case 0xA: vol += 2
+        case 0xB: vol += 4
+        case 0xC: vol += 8
+        case 0xD: vol += 16
+        case 0xE: vol = vol * 3 / 2
+        case 0xF: vol <<= 1
+        default: break
+        }
+        voices[c].volume = max(0, min(64, vol))
+        voices[c].pos = 0
+        voices[c].forward = true
+        voices[c].active = !voices[c].pcm.isEmpty
+    }
+
+    /// FT2 arpeggio: the step comes from the tick counter, which
+    /// counts down from `speed`, so the order is (speed - tick) % 3.
+    private func arpeggio(channel c: Int, param: UInt8) {
+        let semis: Int
+        switch (speed - tick) % 3 {
+        case 1: semis = Int(param >> 4)
+        case 2: semis = Int(param & 0x0F)
+        default: semis = 0
+        }
+        guard semis > 0 else { return }
+        if linear {
+            voices[c].outPeriod = max(1, voices[c].period - Double(semis * 64))
+        } else {
+            voices[c].outPeriod = voices[c].period / pow(2, Double(semis) / 12)
+        }
+    }
+
+    // MARK: - Outputs (envelopes, fade-out, auto-vibrato)
+
+    private func updateOutputs() {
+        for c in 0..<voices.count {
+            if tick == 0 && !inRowRepeat {
+                voices[c].outPeriod = voices[c].period
+                voices[c].outVolume = voices[c].volume
+            }
+            guard voices[c].active, let ins = currentInstrument(c) else {
+                voices[c].finalVolume = 0
+                continue
+            }
+
+            var envVolume = 1.0
+            if ins.volumeEnvelope.enabled {
+                envVolume = envelopeStep(ins.volumeEnvelope, frame: &voices[c].volEnvFrame,
+                                         keyOff: voices[c].keyOff) / 64
+            }
+            var envPan = 32.0
+            if ins.panningEnvelope.enabled {
+                envPan = envelopeStep(ins.panningEnvelope, frame: &voices[c].panEnvFrame,
+                                      keyOff: voices[c].keyOff)
+            }
+            if voices[c].keyOff && ins.volumeEnvelope.enabled {
+                voices[c].fadeout = max(0, voices[c].fadeout - Int(ins.volumeFadeout))
+                if voices[c].fadeout == 0 { voices[c].active = false }
+            }
+
+            var period = voices[c].outPeriod
+            let av = ins.autoVibrato
+            if av.depth > 0 {
+                if voices[c].autoVibSweep > 0 && !voices[c].keyOff {
+                    voices[c].autoVibAmp += voices[c].autoVibSweep
+                    if voices[c].autoVibAmp >> 8 > Int(av.depth) {
+                        voices[c].autoVibAmp = Int(av.depth) << 8
+                        voices[c].autoVibSweep = 0
+                    }
+                }
+                voices[c].autoVibPos = (voices[c].autoVibPos + Int(av.rate)) & 0xFF
+                let pos = voices[c].autoVibPos
+                let wave: Int
+                switch av.type {
+                case 1: wave = pos > 127 ? 64 : -64
+                case 2: wave = (((pos >> 1) + 64) & 127) - 64
+                case 3: wave = (((-(pos >> 1)) + 64) & 127) - 64
+                default: wave = Self.autoVibratoSine[pos]
+                }
+                period += Double((wave * voices[c].autoVibAmp) >> 14)
+            }
+            period = min(Self.periodRange.upperBound, max(Self.periodRange.lowerBound, period))
+            voices[c].step = frequency(forPeriod: period) / sampleRate
+
+            let volume = Double(voices[c].outVolume) / 64 * envVolume
+                * Double(voices[c].fadeout) / 32768 * Double(globalVolume) / 64
+            voices[c].finalVolume = Float(max(0, min(1, volume)))
+
+            let pan = Double(voices[c].panning)
+            let finalPan = pan + (envPan - 32) * (128 - abs(pan - 128)) / 32
+            voices[c].finalPan = Float(max(-1, min(1, (finalPan - 128) / 128)))
+        }
+    }
+
+    /// Value of `envelope` at `frame`, then advance the frame with
+    /// sustain and loop handling.
+    private func envelopeStep(_ env: XMInstrument.Envelope, frame: inout Int, keyOff: Bool) -> Double {
+        let points = env.points
+        guard !points.isEmpty else { return 64 }
+        let value = envelopeValue(points, at: frame)
+
+        let count = points.count
+        if env.sustainEnabled, env.sustainPoint < count, !keyOff,
+           frame == Int(points[env.sustainPoint].frame) {
+            return value
+        }
+        frame += 1
+        if env.loopEnabled, env.loopStart <= env.loopEnd, env.loopEnd < count,
+           frame == Int(points[env.loopEnd].frame) {
+            let releasedAtSustain = keyOff && env.sustainEnabled && env.loopEnd == env.sustainPoint
+            if !releasedAtSustain {
+                frame = Int(points[env.loopStart].frame)
+            }
+        }
+        frame = min(frame, 0xFFFF)
+        return value
+    }
+
+    private func envelopeValue(_ points: [XMInstrument.Envelope.Point], at frame: Int) -> Double {
+        if frame <= Int(points[0].frame) || points.count == 1 {
+            return Double(points[0].value)
+        }
+        for i in 1..<points.count {
+            let b = points[i]
+            guard frame < Int(b.frame) else { continue }
+            let a = points[i - 1]
+            let span = Int(b.frame) - Int(a.frame)
+            guard span > 0 else { return Double(b.value) }
+            let t = Double(frame - Int(a.frame)) / Double(span)
+            return Double(a.value) + (Double(b.value) - Double(a.value)) * min(1, max(0, t))
+        }
+        return Double(points[points.count - 1].value)
     }
 
     // MARK: - Frequency math
 
-    /// Compute period from a note (1..96 nominal) and finetune
-    /// (-128..+127). Real note may exceed 96 once relative-note
-    /// offsets are applied.
-    private func computePeriod(note: Int, finetune: Int) -> Double {
-        switch file.frequencyTable {
-        case .linear:
-            return 7680.0 - Double(note) * 64.0 - Double(finetune) / 2.0
-        case .amiga:
-            let n = max(0, min(95, note))
-            let idx = (n % 12) * 8 + Int(Double(finetune) / 16.0).clamped(to: 0...7)
-            let octave = n / 12
-            let baseIndex = (idx < 0) ? 0 : (idx >= Self.amigaPeriods.count ? Self.amigaPeriods.count - 1 : idx)
-            let raw = Double(Self.amigaPeriods[baseIndex])
-            return raw * 16.0 / pow(2.0, Double(octave))
+    /// Period for a 0-based note (C-0 = 0) and finetune (-128...127).
+    private func periodFor(note: Int, finetune: Int) -> Double {
+        if linear {
+            return 7680 - Double(note * 64) - Double(finetune) / 2
         }
+        let n = max(0, min(119, note))
+        let position = Double(n % 12 * 8 + 8) + Double(finetune) / 16
+        let i0 = Int(position.rounded(.down))
+        let frac = position - Double(i0)
+        func entry(_ i: Int) -> Double {
+            i < 96 ? Self.amigaPeriods[max(0, i)] : Self.amigaPeriods[i - 96] / 2
+        }
+        let base = entry(i0) + (entry(i0 + 1) - entry(i0)) * frac
+        return base * 32 / Double(1 << (n / 12))
     }
 
     private func frequency(forPeriod period: Double) -> Double {
-        switch file.frequencyTable {
-        case .linear:
-            return 8363.0 * pow(2.0, (4608.0 - period) / 768.0)
-        case .amiga:
-            return period > 0 ? (8363.0 * 1712.0 / period) : 0
+        if linear {
+            return 8363 * pow(2, (4608 - period) / 768)
         }
+        return 8363 * 1712 / period
     }
 
-    /// Amiga period table (96 entries, one octave's worth of
-    /// finetune-extended values).
-    private static let amigaPeriods: [Int] = [
-        907, 900, 894, 887, 881, 875, 868, 862,
-        856, 850, 844, 838, 832, 826, 820, 814,
-        808, 802, 796, 791, 785, 779, 774, 768,
-        762, 757, 752, 746, 741, 736, 730, 725,
-        720, 715, 709, 704, 699, 694, 689, 684,
-        678, 675, 670, 665, 660, 655, 651, 646,
-        640, 636, 632, 628, 623, 619, 614, 610,
-        604, 601, 597, 592, 588, 584, 580, 575,
-        570, 567, 563, 559, 555, 551, 547, 543,
-        538, 535, 532, 528, 524, 520, 516, 513,
-        508, 505, 502, 498, 494, 491, 487, 484,
-        480, 477, 474, 470, 467, 463, 460, 457
-    ]
+    private func snapToSemitone(_ period: Double, channel c: Int) -> Double {
+        let finetune = voices[c].finetune
+        if linear {
+            let note = ((7680 - period - Double(finetune) / 2) / 64).rounded()
+            return periodFor(note: Int(note), finetune: finetune)
+        }
+        var best = period
+        var bestDistance = Double.infinity
+        for n in 0..<120 {
+            let candidate = periodFor(note: n, finetune: finetune)
+            let d = abs(candidate - period)
+            if d < bestDistance {
+                bestDistance = d
+                best = candidate
+            }
+        }
+        return best
+    }
+
+    // MARK: - Test support
+
+    /// Snapshot of one channel's playback state, for unit tests.
+    struct VoiceSnapshot {
+        var period: Double
+        var outPeriod: Double
+        var volume: Int
+        var outVolume: Int
+        var panning: Int
+        var active: Bool
+        var pos: Double
+        var keyOff: Bool
+        var fadeout: Int
+        var finalVolume: Float
+        var finalPan: Float
+        var step: Double
+    }
+
+    /// Internal: state of channel `c` (tests only).
+    func snapshot(channel c: Int) -> VoiceSnapshot {
+        let v = voices[c]
+        return VoiceSnapshot(period: v.period, outPeriod: v.outPeriod, volume: v.volume,
+                             outVolume: v.outVolume, panning: v.panning, active: v.active,
+                             pos: v.pos, keyOff: v.keyOff, fadeout: v.fadeout,
+                             finalVolume: v.finalVolume, finalPan: v.finalPan, step: v.step)
+    }
+
+    /// Internal: current speed, BPM and global volume (tests only).
+    var timing: (speed: Int, bpm: Int, globalVolume: Int) { (speed, bpm, globalVolume) }
 
     // MARK: - Timing
 
-    private func framesPerTick() -> Int {
-        let tickRate = Double(tempo) * 2.0 / 5.0
-        return max(1, Int(sampleRate / tickRate))
-    }
-}
-
-private extension Int {
-    func clamped(to range: ClosedRange<Int>) -> Int {
-        Swift.min(range.upperBound, Swift.max(range.lowerBound, self))
+    /// Frames in the next tick, carrying the fractional remainder so
+    /// long renders do not drift.
+    private func nextTickFrameCount() -> Int {
+        tickFrameFraction += sampleRate / (Double(bpm) * 2 / 5)
+        let whole = Int(tickFrameFraction)
+        tickFrameFraction -= Double(whole)
+        return whole
     }
 }
