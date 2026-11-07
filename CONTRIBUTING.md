@@ -8,11 +8,13 @@ Thanks for the interest. SwiftXM is a focused library. The bar is "ships clean, 
 swift test
 ```
 
-The test target uses Swift Testing (the `import Testing` framework), not XCTest. Tests live in `Tests/SwiftXMTests/`. Add a test for any behavioral change. The suite is small enough that adding a case or two is cheap and forces you to articulate intent.
+The test target uses Swift Testing (the `import Testing` framework), not XCTest. Tests live in `Tests/SwiftXMTests/`. Add a test for any behavioral change, built from hand-constructed bytes (see `XMBuilder`) rather than binary fixtures.
+
+Before opening a pull request, also check that the package builds cleanly:
 
 ```sh
-swift build
-swift build -c release
+swift build -c release -Xswiftc -warnings-as-errors
+xcodebuild build -scheme SwiftXM -destination 'generic/platform=iOS' -quiet
 ```
 
 ## Commit style
@@ -35,7 +37,7 @@ For anything non-trivial (new effect implementation, parser change, public API c
 
 When opening a PR, ensure:
 
-- `swift test` passes locally
+- `swift test` passes locally and the release build has zero warnings
 - New public symbols have `///` doc comments
 - No new dependencies (Foundation only, by design)
 - The public API of `XMFile`, `XMMixer`, and `XMError` is unchanged unless explicitly discussed
