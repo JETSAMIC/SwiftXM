@@ -109,45 +109,46 @@ final class XMPlayer {
 
 ## Spec coverage
 
-Checked field by field against [`Reference/xm-form.txt`](Reference/xm-form.txt). Where the document is silent or wrong, playback follows FT2's replayer (as reproduced by ft2-clone) and OpenMPT's loader.
+The authoritative spec is [`Reference/XM-Format.md`](Reference/XM-Format.md): byte layouts of all three format versions, the frequency, envelope and effect algorithms, FT2's replayer quirks (each attributed to the OpenMPT test case that documents it), robustness guidance and errata for the archived [`Reference/xm-form.txt`](Reference/xm-form.txt). This table mirrors its implementation-status section.
 
 | Feature | Status |
 |---|---|
-| Header, header-size field (honoured, not assumed 276) | Supported |
+| Header, header-size field (honoured, not assumed 276), short order table | Supported |
 | Versions 0x0104, 0x0103, 0x0102 (old layout, 1-byte row count) | Supported; others rejected |
-| Linear and Amiga frequency tables | Supported |
-| Order table, song length, entries naming missing patterns | Supported (missing = empty 64-row pattern, as FT2) |
-| Restart position | Parsed; playback stops at the end instead of looping |
-| Packed and unpacked pattern cells, 0-length (empty) patterns, 0 rows | Supported (0 rows = 64) |
+| Patterns: header length honoured, packed and unpacked cells, empty patterns, 0 rows = 64, up to 1024 rows | Supported |
 | Instrument header size quirks (larger, smaller, < 29), sample-header size 0 | Supported |
-| 8-bit / 16-bit delta-encoded samples | Supported |
-| ModPlug ADPCM samples (reserved byte 0xAD) | Supported |
+| 8-bit / 16-bit delta-encoded samples, ModPlug ADPCM | Supported |
+| OpenMPT stereo samples | Partial (mixed down to mono) |
+| OpenMPT trailing chunks (`text`, `MIDI`, `PNAM`, `CNAM`, `XTPM`, `STPM`, plugins) | Unsupported (ignored) |
 | Forward / ping-pong loops, zero-length loops | Supported |
-| Volume / panning envelopes (12 points, sustain, loop) | Supported (frame-based model of FT2) |
-| Fade-out | Supported (FT2 base 32768) |
-| Auto-vibrato (4 waveforms, sweep, freeze on key off) | Supported |
-| Note / instrument rules (Play, Switch, OldVol, Cut) | Supported |
-| Volume column: set, slides, fine slides, vibrato speed/depth, pan, pan slides, tone porta | Supported |
-| 0 arpeggio (FT2 tick-counter order) | Supported |
-| 1/2 porta, 3 tone porta (shared with Mx), 4 vibrato, 5, 6, 7 tremolo | Supported |
-| 8 pan, 9 offset (with note only), A volume slide, B jump, C volume, D break (BCD) | Supported |
+| Linear and Amiga frequency tables, finetune precision (top five bits) | Supported |
+| Volume / panning envelopes (12 points, sustain, loop, panning-sustain rule) | Supported |
+| Fade-out (32768 base, also without a volume envelope, pick-up by portamento) | Supported |
+| Auto-vibrato (4 waveforms, sweep, key-off during sweep) | Supported |
+| Note / instrument rules (Switch, Play, OldVol from the playing sample, Cut, note range) | Supported (`SampleChange.xm` edge case not reproduced) |
+| Key-off with and without envelope, key-off + instrument, `K00` | Supported |
+| Volume column: set, slides, fine slides, vibrato speed/depth, pan (incl. left-slide-0 quirk), pan slides, tone porta | Supported |
+| 0 arpeggio (down-counting table incl. speeds above 16, semitone rounding, B-7 clamp) | Supported |
+| 1/2 porta, 3 tone porta (shared with Mx, FT2 direction memory), 4 vibrato, 5, 6, 7 tremolo | Supported |
+| Pitch left detuned after a volume-column vibrato (`VibratoCombinations.xm`) | Unsupported (pitch restored each row, as OpenMPT) |
+| 8 pan, 9 offset (memory only with a note, ignored with porta), A volume slide, B jump, C volume, D break | Supported |
 | E1/E2 fine porta, E3 glissando, E4/E7 waveforms, E5 finetune | Supported |
 | E6 pattern loop (per channel, incl. FT2 next-pattern quirk) | Supported |
-| E9 retrigger, EA/EB fine volume, EC cut, ED delay, EE pattern delay | Supported |
-| E0 / E8 / EF | Ignored (no effect in FT2) |
-| F speed / BPM (F00 ignored) | Supported |
-| G / H global volume, K key off (tick), L envelope position, P pan slide | Supported |
-| R multi-retrig, T tremor, X1/X2 extra-fine porta | Supported |
-| Random vibrato waveform | FT2 behaviour (plays as square) |
-| FT2 arpeggio quirk for speeds above 16 | Unsupported (plain modulo used) |
-| Envelope sustain at the same point as loop end while held | Partial (holds; FT2's exact edge case differs) |
-| Q, Z (SoundTracker filter) and other non-FT2 effects | Ignored |
-| Song looping | Playback stops when the song loops back to a played row |
+| E9 retrigger (incl. E90), EA/EB fine volume, EC cut, ED delay (FT2 quirks), EE pattern delay (rightmost wins) | Supported |
+| F speed / BPM | Supported; F00 ignored instead of stalling the row |
+| G / H global volume | Supported (applies from the same tick for every channel) |
+| K key off (tick), L envelope position (FT2 panning bug), P pan slide | Supported |
+| R multi-retrig (incl. tick 0), T tremor, X1/X2 extra-fine porta | Supported (`TremorRecover.xm` volume case not reproduced) |
+| E0 / E8 / EF, OpenMPT X5/X6/X9/XA, Y, Z, `\`, SoundTracker Q/Z | Ignored |
+| Square-root pan law | Supported |
+| FT2 volume ramping and exact mixer interpolation | Unsupported (linear interpolation) |
+| Restart position / song looping | Parsed; playback stops when the song ends or loops back to a played row |
 
 ## Limitations
 
-- Mixing is linear-interpolated with a linear pan law; FT2's volume ramping and its exact mixer are not reproduced.
-- Arpeggio, glissando and the Amiga period table are computed rather than read from FT2's 1936-entry lookup tables, so pitches can differ by a fraction of a period unit.
+- Mixing is linear-interpolated without FT2's volume ramping.
+- The Amiga table is interpolated from FT2's 96-entry base table rather than read from FT2's expanded lookup table, so pitches can differ by a fraction of a period unit; FT2's period wrap-around at extremely low frequencies is not reproduced.
+- `F00` is ignored (FT2 stalls on that row for 65536 ticks).
 - Output gain is divided by the channel count, so busy modules are quiet rather than clipped.
 - Playback stops instead of looping; recreate the mixer to loop.
 
@@ -161,7 +162,7 @@ All sizes and offsets in the file are treated as untrusted. Truncated or inconsi
 
 The XM format brought several novel features over the older Amiga/PC `.mod` and `.s3m` formats: multi-sample instruments with note-to-sample mapping, volume and panning envelopes with sustain and loop points, instrument auto-vibrato, key-off with a fade-out parameter, a "volume column" alongside the effect column for compact volume commands, ping-pong loops, both 8-bit and 16-bit samples (delta-encoded for compression), and a choice between linear and Amiga frequency tables. The 60-byte ASCII header begins with the literal string `"Extended Module: "`, and the rest of the file is laid out as a sequence of variable-length sections addressed by the header.
 
-The canonical reference is [`Reference/xm-form.txt`](Reference/xm-form.txt), the "Complete XM module format specification v0.81" by Matti "ccr" Hamalainen of TNSP (2000-2001), itself built on Mr.H's original 1994 document. This library follows it, and FT2's actual replayer behaviour (as reproduced by ft2-clone and OpenMPT) where the document is silent or wrong; the corrections are annotated inline in the Reference copy.
+The authoritative reference is [`Reference/XM-Format.md`](Reference/XM-Format.md), written for this package. It builds on the "Complete XM module format specification v0.81" by Matti "ccr" Hamalainen of TNSP (2000-2001), itself based on Mr.H's original 1994 document, which is archived verbatim as [`Reference/xm-form.txt`](Reference/xm-form.txt); its errors are listed in the errata of `XM-Format.md`. Where the old documents are silent or wrong, the spec follows FT2's actual replayer behaviour as documented by OpenMPT's FT2 test cases.
 
 If you watched a demo at [Assembly](https://en.wikipedia.org/wiki/Assembly_(demoparty)) or any of the major European demoparties between 1995 and 1999, there's a strong chance the soundtrack was an XM.
 
@@ -175,9 +176,10 @@ Linear pitch: `period = 7680 - note*64 - finetune/2`, `Hz = 8363 * 2^((4608 - pe
 
 ## References and credits
 
-- "The Complete XM module format specification v0.81" by Matti "ccr" Hamalainen / TNSP, based on Mr.H / Triton's original (mirrored, with corrections annotated inline, in [`Reference/xm-form.txt`](Reference/xm-form.txt)).
-- ft2-clone by Olav "8bitbubsy" Sorensen, for FT2's replayer behaviour.
-- OpenMPT's XM loader, for header-size and instrument-header quirks.
+- [`Reference/XM-Format.md`](Reference/XM-Format.md), SwiftXM's comprehensive XM specification, written from the documents below and black-box observation.
+- "The Complete XM module format specification v0.81" by Matti "ccr" Hamalainen / TNSP, based on Mr.H / Triton's original (archived verbatim in [`Reference/xm-form.txt`](Reference/xm-form.txt)).
+- The OpenMPT wiki's XM test-case descriptions and effect reference, for FT2's replayer quirks.
+- ft2-clone by Olav "8bitbubsy" Sorensen, as a black-box reference for FT2 output.
 
 ## License
 

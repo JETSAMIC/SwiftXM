@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replayer semantics, with `currentOrder` / `currentRow`.
 - Typed `XMError` cases for every rejected input.
 - DocC catalog, Swift Package Index configuration, CI workflow.
+- `Reference/XM-Format.md`, the comprehensive format specification with
+  errata for the archived `Reference/xm-form.txt` (restored verbatim).
+- OpenMPT stereo samples are decoded and mixed down to mono.
 
 ### Changed
 - `XMMixer.init(file:sampleRate:)` now throws `XMError.invalidSampleRate`.
@@ -35,3 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Vibrato and tremolo were far shallower than FT2's; auto-vibrato
   waveform types were mapped to the wrong shapes.
 - Forward loops wrapped at the sample end instead of the loop end.
+- FT2 replayer quirks from the spec: fade-out without a volume envelope
+  and pick-up after a fade, key-off + instrument, `K00`, instrument-only
+  rows using the playing sample's defaults, `9xx` memory, tone-porta
+  direction, finetune precision, the arpeggio table, auto-vibrato
+  key-off, `EDx`, `EEx`, `Rxy` and `E90` timing, tremor reset, the
+  volume-column pan-slide quirk, panning-envelope sustain and FT2's
+  square-root pan law.
