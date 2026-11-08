@@ -352,4 +352,23 @@ struct XMParserSpecTests {
         #expect(XMVolumeCommand(byte: 0xEB) == .panSlideRight(11))
         #expect(XMVolumeCommand(byte: 0xFC) == .tonePorta(0xC0))
     }
+
+    @Test("Stereo samples (OpenMPT type bit 5, XM-Format.md §3.7.3) are split, delta-decoded per channel and mixed to mono")
+    func stereoSample() throws {
+        var ins = XMBuilder.Instrument()
+        var s = XMBuilder.Sample()
+        s.rawBody = [10, 10, 10, 10, 30, 0, 0, 0]   // left 10 20 30 40, right 30 30 30 30
+        s.loopType = 0x21                            // forward loop + stereo
+        s.loopStart = 2                              // bytes: frame 1
+        s.loopLength = 4                             // bytes: 2 frames
+        ins.samples = [s]
+        var b = XMBuilder()
+        b.instruments = [ins]
+        let sample = try XMFile(data: b.build()).instruments[0].samples[0]
+        #expect(sample.pcm == [20 << 8, 25 << 8, 30 << 8, 35 << 8])
+        #expect(sample.lengthFrames == 4)
+        #expect(sample.loopBegin == 1)
+        #expect(sample.loopEnd == 3)
+        #expect(sample.loopMode == .forward)
+    }
 }

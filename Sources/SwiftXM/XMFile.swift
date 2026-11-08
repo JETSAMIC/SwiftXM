@@ -1,11 +1,8 @@
 /// XMFile.swift
 ///
-/// Parser for FastTracker II (.xm) "Extended Module" files. Follows
-/// the spec mirrored under `Reference/xm-form.txt` (the "Complete XM
-/// module format specification v0.81" by ccr/TNSP, itself built on
-/// Mr.H/Triton's 1994 original) and, where that document is silent or
-/// wrong, the de-facto behaviour of FT2 (as reproduced by ft2-clone)
-/// and OpenMPT's XM loader.
+/// Parser for FastTracker II (.xm) "Extended Module" files, following
+/// `Reference/XM-Format.md` (SwiftXM's comprehensive spec, which also
+/// lists the errata of the archived `Reference/xm-form.txt`).
 ///
 /// Layout handled:
 ///
@@ -578,7 +575,8 @@ public struct XMSample: Sendable {
     public let panning: UInt8
     /// Transpose in semitones applied to every note.
     public let relativeNote: Int8
-    /// Decoded (delta-undone) PCM; 8-bit data is scaled to 16-bit.
+    /// Decoded (delta-undone) PCM; 8-bit data is scaled to 16-bit and
+    /// OpenMPT stereo samples are mixed down to mono.
     public let pcm: [Int16]
 
     /// The 40-byte on-disk sample header.
@@ -614,9 +612,13 @@ public struct XMSample: Sendable {
     }
 
     /// Decode a sample body at `cursor`, advancing past it. Data cut
-    /// off by the end of the file is clipped.
+    /// off by the end of the file is clipped. Stereo samples (type bit
+    /// 5, an OpenMPT extension) store the whole left channel, then the
+    /// whole right channel, each delta-coded from zero; they are mixed
+    /// down to mono.
     init(header: Header, bytes: [UInt8], cursor: inout Int) {
         let bits16 = header.type & 0x10 != 0
+        let stereo = header.type & 0x20 != 0 && header.reserved != 0xAD
         let remaining = max(0, bytes.count - cursor)
         let declared = Int(min(UInt64(header.byteLength), UInt64(remaining)))
         var pcm: [Int16] = []
@@ -639,28 +641,25 @@ public struct XMSample: Sendable {
                 }
             }
             cursor += used
-        } else if bits16 {
-            var running: Int16 = 0
-            pcm.reserveCapacity(declared / 2)
-            var p = cursor
-            for _ in 0..<(declared / 2) {
-                let delta = Int16(bitPattern: UInt16(bytes[p]) | UInt16(bytes[p + 1]) << 8)
-                running = running &+ delta
-                pcm.append(running)
-                p += 2
+        } else if stereo {
+            // Each channel holds half of the declared bytes; a channel cut
+            // short by the end of the file reads as silence.
+            let width = bits16 ? 2 : 1
+            let frames = Int(header.byteLength / UInt32(width * 2))
+            let left = Self.decodeDelta(bytes, from: cursor, frames: frames, bits16: bits16)
+            let right = Self.decodeDelta(bytes, from: cursor + frames * width, frames: frames, bits16: bits16)
+            pcm.reserveCapacity(left.count)
+            for i in 0..<left.count {
+                let r = i < right.count ? Int(right[i]) : 0
+                pcm.append(Int16((Int(left[i]) + r) / 2))
             }
             cursor += declared
         } else {
-            var running: Int8 = 0
-            pcm.reserveCapacity(declared)
-            for i in 0..<declared {
-                running = running &+ Int8(bitPattern: bytes[cursor + i])
-                pcm.append(Int16(running) << 8)
-            }
+            pcm = Self.decodeDelta(bytes, from: cursor, frames: declared / (bits16 ? 2 : 1), bits16: bits16)
             cursor += declared
         }
 
-        let divisor: UInt32 = bits16 ? 2 : 1
+        let divisor: UInt32 = (bits16 ? 2 : 1) * (stereo ? 2 : 1)
         let length = pcm.count
         let loopStart = Int(min(header.loopStart / divisor, UInt32(length)))
         let loopEndRaw = UInt64(header.loopStart / divisor) + UInt64(header.loopLength / divisor)
@@ -685,13 +684,39 @@ public struct XMSample: Sendable {
         self.relativeNote = header.relativeNote
         self.pcm = pcm
     }
+
+    /// Undo delta coding for up to `frames` frames starting at `start`,
+    /// stopping at the end of the data. 8-bit values are scaled to 16
+    /// bits.
+    private static func decodeDelta(_ bytes: [UInt8], from start: Int, frames: Int, bits16: Bool) -> [Int16] {
+        let width = bits16 ? 2 : 1
+        let available = start < bytes.count ? (bytes.count - start) / width : 0
+        let count = max(0, min(frames, available))
+        var out: [Int16] = []
+        out.reserveCapacity(count)
+        if bits16 {
+            var running: Int16 = 0
+            for i in 0..<count {
+                let p = start + i * 2
+                running = running &+ Int16(bitPattern: UInt16(bytes[p]) | UInt16(bytes[p + 1]) << 8)
+                out.append(running)
+            }
+        } else {
+            var running: Int8 = 0
+            for i in 0..<count {
+                running = running &+ Int8(bitPattern: bytes[start + i])
+                out.append(Int16(running) << 8)
+            }
+        }
+        return out
+    }
 }
 
 // MARK: - Volume column
 
 /// Decoded XM volume-column byte. The column packs ten different
-/// "mini commands" into a single byte; see "Effects in volume column"
-/// in `Reference/xm-form.txt`.
+/// "mini commands" into a single byte; see §4.4 of
+/// `Reference/XM-Format.md`.
 public enum XMVolumeCommand: Sendable, Hashable {
     /// No command (0x00-0x0F and the unused 0x51-0x5F).
     case none
