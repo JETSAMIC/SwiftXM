@@ -166,10 +166,6 @@ Offset|Length| Type   | Description
    ?  |   4  | (dword)| Pattern header length
   +4  |   1  | (byte) | Packing type (always 0)
   +5  |   2  | (word) | Number of rows in pattern (1..256)
-      |      |        | [SwiftXM note: in version $0102 this field is
-      |      |        |  a single byte holding rows-1, which makes the
-      |      |        |  pattern header 8 bytes long. A stored 0 is
-      |      |        |  treated as 64 rows, as OpenMPT does.]
   +7  |   2  | (word) | Packed patterndata size
       |      |        | << Note! This is zero if the pattern is
       |      |        | completely empty and no pattern data
@@ -276,15 +272,10 @@ Offset|Length| Type   | Description
   +8  |  4   | (dword)| Sample loop length
  +12  |  1   | (byte) | Volume
  +13  |  1   | (byte) | Finetune (signed byte -16..+15)
-      |      |        | [SwiftXM note: the full signed byte range
-      |      |        |  -128..+127 is used, in 1/128 semitones; see
-      |      |        |  "Periods and frequencies" below.]
  +14  |  1   | (byte) | Type of sample, bit meanings:
       |      |        | 0-1: 00 = 0 dec = No loop,
       |      |        |      01 = 1 dec = Forward loop,
       |      |        |      11 = 2 dec = Ping-pong loop;
-      |      |        | [SwiftXM note: ping-pong is binary 10 (= 2);
-      |      |        |  players also treat 11 (= 3) as ping-pong.]
       |      |        |   4: 16-bit sampledata
  +15  |  1   | (byte) | Panning (0-255)
  +16  |  1   | (byte) | Relative note number (signed byte)
@@ -370,12 +361,6 @@ PSEUDOCODE:
      c_note = dbyt;
      current_row++;
      }
-
-[SwiftXM note: the else branch above is wrong. A byte with the MSB
- clear is an unpacked note and is followed by the other four bytes
- (instrument, volume, effect, parameter). Each 0x80-prefixed or
- unpacked entry fills ONE channel; rows advance after channelCount
- entries.]
 
    ...
 
@@ -482,10 +467,6 @@ Fadeout
 The FadeOutVol is originally 65536 (after the note has been triggered) and
 is decremented by "Instrument.Fadeout" each tick after note is released
 (with KeyOff Effect or with KeyOff Note)
-
-[SwiftXM note: FT2's replayer (as reproduced by ft2-clone) starts the
- fade-out amplitude at 32768, not 65536, so a fade takes half as many
- ticks as this formula suggests. SwiftXM follows FT2.]
 
 NOTICE: Fadeout is not processed if Volume Envelope is DISABLED.
         (This means that the FadeOutVol stays at 65536)
@@ -749,10 +730,6 @@ PeriodTab = Array[0..12*8-1] of Word = (
 31:  X1 |  (*) | Extra fine porta up
 --:  X2 |  (*) | Extra fine porta down
 
-[SwiftXM note: the numbers for P, R, T and X above are off. Effect
- bytes map letters to 10 + (letter - 'A'): P = 25 (19h), R = 27 (1Bh),
- T = 29 (1Dh), X = 33 (21h).]
-
 (*) = If the effect PARAMETER byte is zero, the last nonzero
       byte for the effect should be used. (This means that the
       effect "remembers" it's parameters!)
@@ -944,9 +921,6 @@ Kxx  - Key Off ( also note number 97 )
 --------------------------------------
 The parameter of this effect does not have any meaning.
 (At least any that I would be aware of)
-
-[SwiftXM note: FT2 2.0x does use it: the key off happens on tick xx
- of the row (K00 = immediately), as ft2-clone reproduces.]
 
 This effect does the same as note-number 97 dec, in practice,
 it "releases" the virtual "key" or note. See description of
