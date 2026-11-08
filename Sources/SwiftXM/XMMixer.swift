@@ -6,13 +6,14 @@
 /// auto-vibrato, and writes interleaved stereo `Float32` PCM into a
 /// caller-provided buffer.
 ///
-/// Playback follows FastTracker II's replayer (as documented in
-/// `Reference/xm-form.txt` and reproduced by ft2-clone): per-effect
-/// memories, FT2's flow state (`pBreakPos`, position-jump flag,
-/// per-channel `E6x` loops including the "next pattern starts at the
-/// loop row" quirk), `EEx` repeats that only run per-tick effects, the
-/// tick-counter-based arpeggio order, and FT2's vibrato / tremolo /
-/// tremor / multi-retrig arithmetic.
+/// Playback follows FastTracker II's replayer as specified in
+/// `Reference/XM-Format.md` §5-§6: per-effect memories, FT2's flow
+/// state (break row, position-jump flag, per-channel `E6x` loops
+/// including the "next pattern starts at the loop row" quirk), `EEx`
+/// repeats that only run per-tick effects, the down-counting arpeggio
+/// table, FT2's note-delay, key-off and fade-out rules, its vibrato /
+/// tremolo / tremor / multi-retrig arithmetic and its square-root pan
+/// law. Each quirk cites the OpenMPT test case that documents it.
 ///
 /// ## Timing model
 /// `speed` (effect `Fxx` < 0x20) is ticks per row; `bpm` (`Fxx` >=
@@ -23,6 +24,7 @@
 ///   `Hz = 8363 * 2^((4608 - period) / 768)`.
 /// - Amiga: FT2's 96-entry period table, interpolated for finetune,
 ///   `Hz = 8363 * 1712 / period`.
+/// FT2 uses only the top five bits of the finetune in both tables.
 /// `note` is 0-based here (C-0 = 0), i.e. pattern note - 1 + the
 /// sample's relative note.
 
@@ -111,13 +113,16 @@ public final class XMMixer: @unchecked Sendable {
         var outPeriod: Double = 0
         var targetPeriod: Double = 0
         var portaSpeed = 0          // 3xx / Mx memory, already * 4
+        var portaDirection = PortaDirection.none
 
         // Volume / panning.
         var volume = 0
         var outVolume = 0
         var panning = 128
+        var sampleVolume = 0        // playing sample's defaults (FT2 oldVol / oldPan)
+        var samplePanning = 128
         var finalVolume: Float = 0
-        var finalPan: Float = 0
+        var finalPan: Float = 128   // 0...255
 
         // Instrument state.
         var keyOff = false
@@ -127,6 +132,7 @@ public final class XMMixer: @unchecked Sendable {
         var autoVibPos = 0
         var autoVibAmp = 0
         var autoVibSweep = 0
+        var panSustainLocked = false
 
         // Effect memories (FT2 keeps one per effect).
         var memPortaUp: UInt8 = 0
@@ -166,6 +172,11 @@ public final class XMMixer: @unchecked Sendable {
         var delayTick = -1
     }
 
+    /// FT2's stored tone-portamento direction (period units).
+    private enum PortaDirection {
+        case none, decreasing, increasing
+    }
+
     // MARK: - Tables
 
     /// FT2 / ProTracker vibrato half-sine (32 entries, peak 255).
@@ -180,7 +191,7 @@ public final class XMMixer: @unchecked Sendable {
     }
 
     /// FT2 Amiga period table: 12 notes × 8 finetune steps, starting a
-    /// semitone below C (see Reference/xm-form.txt).
+    /// semitone below C (XM-Format.md §5.3).
     private static let amigaPeriods: [Double] = [
         907, 900, 894, 887, 881, 875, 868, 862, 856, 850, 844, 838, 832, 826, 820, 814,
         808, 802, 796, 791, 785, 779, 774, 768, 762, 757, 752, 746, 741, 736, 730, 725,
@@ -274,10 +285,12 @@ public final class XMMixer: @unchecked Sendable {
     }
 
     private func mixVoice(into buffer: UnsafeMutablePointer<Float>, frames: Int, voice v: Int) {
+        // FT2's square-root pan law (OpenMPT FT2PanLaw.xm): pan 0...255,
+        // so full right is never quite reached.
         let amp = voices[v].finalVolume * mixScale
         let pan = voices[v].finalPan
-        let ampL = amp * (1 - pan) * 0.5
-        let ampR = amp * (1 + pan) * 0.5
+        let ampL = amp * ((256 - pan) / 256).squareRoot()
+        let ampR = amp * (pan / 256).squareRoot()
         let pcm = voices[v].pcm
         let mode = voices[v].loopMode
         let loopStart = voices[v].loopStart
@@ -419,13 +432,16 @@ public final class XMMixer: @unchecked Sendable {
 
     private func processTick0() {
         for c in 0..<voices.count {
-            let cell = pattern.cell(row: row, channel: c)
+            var cell = pattern.cell(row: row, channel: c)
+            // K00 turns the cell's note into a key-off: a note next to it
+            // is ignored and not remembered (OpenMPT key_off.xm, KeyOff2.xm).
+            if cell.effect == 0x14 && cell.param == 0 { cell.note = 97 }
             voices[c].cell = cell
             voices[c].delayedCell = nil
             voices[c].delayTick = -1
             if cell.effect == 0x0E && cell.param >> 4 == 0xD && cell.param & 0x0F != 0 {
-                // EDx: the whole cell (note, instrument, volume column)
-                // plays on tick x.
+                // EDx: nothing in the cell happens on tick 0; it is
+                // evaluated on tick x (see delayedTrigger).
                 voices[c].delayedCell = cell
                 voices[c].delayTick = Int(cell.param & 0x0F)
                 continue
@@ -442,26 +458,32 @@ public final class XMMixer: @unchecked Sendable {
         // Porta speed and offset memories are needed before the note.
         if cell.effect == 0x03 && cell.param != 0 { voices[c].portaSpeed = Int(cell.param) * 4 }
         if cell.volume >= 0xF0 && cell.volume & 0x0F != 0 { voices[c].portaSpeed = Int(cell.volume & 0x0F) * 64 }
-        if cell.effect == 0x09 && cell.param != 0 { voices[c].memOffset = cell.param }
 
+        let note = Int(cell.note)
         var instrumentValid = true
         if cell.instrument > 0 {
             if Int(cell.instrument) <= file.instruments.count {
-                voices[c].instrument = Int(cell.instrument)
+                // An instrument next to a key-off only restores the playing
+                // sample's volume and panning; it does not select anything.
+                if note != 97 { voices[c].instrument = Int(cell.instrument) }
             } else {
                 instrumentValid = false
             }
         }
 
-        let note = Int(cell.note)
         if note == 97 {
             keyOff(channel: c)
+            // Key-off + instrument: volume and panning come back, the
+            // envelopes do not restart, so the note fades out (OpenMPT
+            // keyoff+instr.xm, RetrigFade.xm).
+            if cell.instrument > 0 && instrumentValid {
+                voices[c].volume = voices[c].sampleVolume
+                voices[c].panning = voices[c].samplePanning
+            }
         } else if (1...96).contains(note) {
             if porta && voices[c].period > 0 {
-                if voices[c].portaSpeed > 0 {
-                    voices[c].targetPeriod = periodFor(note: note - 1 + voices[c].relativeNote,
-                                                       finetune: voices[c].finetune)
-                }
+                setPortaTarget(channel: c, period: periodFor(note: note - 1 + voices[c].relativeNote,
+                                                             finetune: voices[c].finetune))
                 if cell.instrument > 0 && instrumentValid { resetToSampleDefaults(channel: c) }
             } else if !instrumentValid {
                 voices[c].active = false
@@ -507,6 +529,8 @@ public final class XMMixer: @unchecked Sendable {
         voices[c].loopMode = smp.loopMode
         voices[c].relativeNote = Int(smp.relativeNote)
         voices[c].finetune = finetune
+        voices[c].sampleVolume = Int(smp.volume)
+        voices[c].samplePanning = Int(smp.panning)
         let period = periodFor(note: realNote, finetune: finetune)
         voices[c].period = period
         voices[c].outPeriod = period
@@ -520,6 +544,9 @@ public final class XMMixer: @unchecked Sendable {
         voices[c].tremorPos = 0
 
         if cell.effect == 0x09 {
+            // The offset memory only changes next to a real note
+            // (OpenMPT OffsetWithoutNote.xm, porta-offset.xm).
+            if cell.param != 0 { voices[c].memOffset = cell.param }
             let offset = Int(voices[c].memOffset) * 256
             if offset >= smp.pcm.count {
                 voices[c].active = false
@@ -534,17 +561,13 @@ public final class XMMixer: @unchecked Sendable {
         }
     }
 
-    /// "OldVol": reset volume and panning to the current sample's
-    /// defaults and retrigger the envelopes, without restarting the
-    /// sample.
+    /// "OldVol": reset volume and panning to the playing sample's
+    /// defaults (FT2 uses the sample that is sounding, not the one the
+    /// new instrument would map) and retrigger the envelopes, without
+    /// restarting the sample.
     private func resetToSampleDefaults(channel c: Int) {
-        guard voices[c].instrument > 0 else { return }
-        let ins = file.instruments[voices[c].instrument - 1]
-        let mapped = voices[c].note > 0 ? Int(ins.sampleMap[voices[c].note - 1]) : voices[c].sampleIndex
-        if mapped >= 0 && mapped < ins.samples.count {
-            voices[c].volume = Int(ins.samples[mapped].volume)
-            voices[c].panning = Int(ins.samples[mapped].panning)
-        }
+        voices[c].volume = voices[c].sampleVolume
+        voices[c].panning = voices[c].samplePanning
         triggerInstrument(channel: c)
     }
 
@@ -555,6 +578,11 @@ public final class XMMixer: @unchecked Sendable {
         voices[c].volEnvFrame = 0
         voices[c].panEnvFrame = 0
         voices[c].autoVibPos = 0
+        voices[c].panSustainLocked = false
+        // An instrument number resets the tremor and multi-retrig
+        // counters (OpenMPT TremorInstr.xm, retrig.xm).
+        voices[c].tremorPos = 0
+        voices[c].retrigCount = 0
         guard voices[c].instrument > 0 else { return }
         let av = file.instruments[voices[c].instrument - 1].autoVibrato
         if av.sweep > 0 {
@@ -614,8 +642,6 @@ public final class XMMixer: @unchecked Sendable {
             globalVolume = min(64, Int(p))
         case 0x11:
             if p != 0 { voices[c].memGlobalSlide = p }
-        case 0x14:
-            if p == 0 { keyOff(channel: c) }
         case 0x15:
             setEnvelopePosition(channel: c, frame: Int(p))
         case 0x19:
@@ -623,6 +649,9 @@ public final class XMMixer: @unchecked Sendable {
         case 0x1B:
             if hi != 0 { voices[c].retrigVolume = Int(hi) }
             if lo != 0 { voices[c].retrigSpeed = Int(lo) }
+            // FT2 also counts tick 0, unless the volume column holds a
+            // command (OpenMPT retrig.xm).
+            if cell.volume == 0 { multiRetrig(channel: c) }
         case 0x1D:
             if p != 0 { voices[c].memTremor = p }
         case 0x21:
@@ -655,6 +684,9 @@ public final class XMMixer: @unchecked Sendable {
             patternLoop(channel: c, value: Int(v))
         case 0x7:
             voices[c].waveControl = (voices[c].waveControl & 0x0F) | Int(v) << 4
+        case 0x9:
+            // E90 retriggers on tick 0 (OpenMPT E90.xm).
+            if v == 0 { retrigger(channel: c) }
         case 0xA:
             if v != 0 { voices[c].memFineVolUp = v }
             voices[c].volume = min(64, voices[c].volume + Int(voices[c].memFineVolUp))
@@ -664,10 +696,13 @@ public final class XMMixer: @unchecked Sendable {
         case 0xC:
             if v == 0 { voices[c].volume = 0 }
         case 0xE:
-            if patternDelay == 0 { patternDelay = Int(v) }
+            // Channels run left to right, so the rightmost EEx wins,
+            // even EE0 (OpenMPT PatternDelays.xm).
+            patternDelay = Int(v)
         default:
-            // E0x (filter) and E8x are unused in FT2; E5x applies with
-            // the note; E9x, ECx (x > 0) and EDx run on later ticks.
+            // E0x (filter), E8x and EFx are unused in FT2; E5x applies
+            // with the note; E9x (x > 0), ECx (x > 0) and EDx run on
+            // later ticks.
             break
         }
     }
@@ -700,11 +735,6 @@ public final class XMMixer: @unchecked Sendable {
 
     private func processTickN() {
         for c in 0..<voices.count {
-            if voices[c].delayTick == tick, let cell = voices[c].delayedCell {
-                voices[c].delayedCell = nil
-                voices[c].delayTick = -1
-                triggerCell(channel: c, cell: cell)
-            }
             let cell = voices[c].cell
             let volumeCommand = XMVolumeCommand(byte: cell.volume)
             let p = cell.param
@@ -715,9 +745,13 @@ public final class XMMixer: @unchecked Sendable {
             switch volumeCommand {
             case .slideDown(let v): voices[c].volume = max(0, voices[c].volume - Int(v))
             case .slideUp(let v): voices[c].volume = min(64, voices[c].volume + Int(v))
-            case .panSlideLeft(let v): voices[c].panning = max(0, voices[c].panning - Int(v))
+            case .panSlideLeft(let v):
+                // FT2 bug: a left slide of 0 sets hard left (OpenMPT
+                // PanSlideZero.xm).
+                voices[c].panning = v == 0 ? 0 : max(0, voices[c].panning - Int(v))
             case .panSlideRight(let v): voices[c].panning = min(255, voices[c].panning + Int(v))
-            case .tonePorta:
+            case .tonePorta where voices[c].delayedCell == nil:
+                // Ignored next to a note delay (OpenMPT porta-delay.xm).
                 tonePorta(channel: c)
                 portaActive = true
             default: break
@@ -768,16 +802,58 @@ public final class XMMixer: @unchecked Sendable {
     private func extendedTickN(channel c: Int, sub: UInt8, value: Int) {
         switch sub {
         case 0x9:
-            if value > 0 && tick % value == 0 {
-                voices[c].pos = 0
-                voices[c].forward = true
-                voices[c].active = !voices[c].pcm.isEmpty
-                triggerInstrument(channel: c)
-            }
+            if value > 0 && tick % value == 0 { retrigger(channel: c) }
         case 0xC:
             if value == tick { voices[c].volume = 0 }
+        case 0xD:
+            // The deferred cell fires by tick number, so it fires again
+            // on every EEx repeat (OpenMPT PatternDelay-NoteDelay.xm).
+            if value == tick, let cell = voices[c].delayedCell { delayedTrigger(channel: c, cell: cell) }
         default:
             break
+        }
+    }
+
+    /// `E9x` retrigger: restart the sample and the envelopes.
+    private func retrigger(channel c: Int) {
+        voices[c].pos = 0
+        voices[c].forward = true
+        voices[c].active = !voices[c].pcm.isEmpty
+        triggerInstrument(channel: c)
+    }
+
+    /// The tick-x half of `EDx` (FT2 semantics; OpenMPT test cases
+    /// delay1-3, envretrig, DelayVolume, OffDelay, PanOff, VolColDelay):
+    /// an empty note retriggers the channel's last note, the envelopes
+    /// always restart, only the volume column's "set volume" and "set
+    /// panning" apply, and a delayed key-off only restarts the envelopes.
+    private func delayedTrigger(channel c: Int, cell: XMPattern.Cell) {
+        if cell.note == 97 {
+            voices[c].volEnvFrame = 0
+            voices[c].panEnvFrame = 0
+            return
+        }
+        var instrumentValid = true
+        if cell.instrument > 0 {
+            if Int(cell.instrument) <= file.instruments.count {
+                voices[c].instrument = Int(cell.instrument)
+            } else {
+                instrumentValid = false
+            }
+        }
+        let note = cell.note != 0 ? Int(cell.note) : voices[c].note
+        if (1...96).contains(note) {
+            if instrumentValid {
+                playNote(channel: c, note: note, cell: cell)
+            } else {
+                voices[c].active = false
+            }
+        }
+        triggerInstrument(channel: c)
+        switch XMVolumeCommand(byte: cell.volume) {
+        case .setVolume(let v): voices[c].volume = Int(v)
+        case .setPanning(let v): voices[c].panning = Int(v)
+        default: break
         }
     }
 
@@ -796,14 +872,36 @@ public final class XMMixer: @unchecked Sendable {
         }
     }
 
+    private func setPortaTarget(channel c: Int, period target: Double) {
+        voices[c].targetPeriod = target
+        if target > voices[c].period {
+            voices[c].portaDirection = .increasing
+        } else if target < voices[c].period {
+            voices[c].portaDirection = .decreasing
+        } else {
+            voices[c].portaDirection = .none
+        }
+    }
+
+    /// FT2 tone portamento: moves in the direction stored with the
+    /// target; once the target is reached the direction is left at
+    /// "increasing", so a later slide from below the target's pitch
+    /// snaps to it (OpenMPT PortaResetDirection.xm).
     private func tonePorta(channel c: Int) {
         let target = voices[c].targetPeriod
         let speed = Double(voices[c].portaSpeed)
         guard voices[c].period > 0, target > 0, speed > 0 else { return }
-        if voices[c].period > target {
-            voices[c].period = max(target, voices[c].period - speed)
-        } else if voices[c].period < target {
+        switch voices[c].portaDirection {
+        case .decreasing:
+            voices[c].period -= speed
+            if voices[c].period <= target {
+                voices[c].period = target
+                voices[c].portaDirection = .increasing
+            }
+        case .increasing:
             voices[c].period = min(target, voices[c].period + speed)
+        case .none:
+            break
         }
     }
 
@@ -890,21 +988,21 @@ public final class XMMixer: @unchecked Sendable {
         voices[c].active = !voices[c].pcm.isEmpty
     }
 
-    /// FT2 arpeggio: the step comes from the tick counter, which
-    /// counts down from `speed`, so the order is (speed - tick) % 3.
+    /// FT2 arpeggio. The step comes from FT2's down-counting tick
+    /// counter `k = speed - tick` through a 16-entry table; for k > 16
+    /// FT2 reads past the table and always lands on the third note
+    /// (OpenMPT Arpeggio.xm). The offset is added to the current period
+    /// rounded to the nearest semitone (ArpSlide.xm) and clamped to B-7
+    /// at finetune 0 (ArpeggioClamp.xm).
     private func arpeggio(channel c: Int, param: UInt8) {
-        let semis: Int
-        switch (speed - tick) % 3 {
-        case 1: semis = Int(param >> 4)
-        case 2: semis = Int(param & 0x0F)
-        default: semis = 0
-        }
-        guard semis > 0 else { return }
-        if linear {
-            voices[c].outPeriod = max(1, voices[c].period - Double(semis * 64))
-        } else {
-            voices[c].outPeriod = voices[c].period / pow(2, Double(semis) / 12)
-        }
+        let k = speed - tick
+        let step = k < 16 ? k % 3 : (k == 16 ? 0 : 2)
+        guard step != 0, voices[c].period > 0 else { return }
+        let semis = step == 1 ? Int(param >> 4) : Int(param & 0x0F)
+        let finetune = voices[c].finetune
+        let target = nearestNote(toPeriod: voices[c].period, finetune: finetune) + semis
+        voices[c].outPeriod = target > 95 ? periodFor(note: 95, finetune: 0)
+                                          : periodFor(note: target, finetune: finetune)
     }
 
     // MARK: - Outputs (envelopes, fade-out, auto-vibrato)
@@ -922,27 +1020,44 @@ public final class XMMixer: @unchecked Sendable {
 
             var envVolume = 1.0
             if ins.volumeEnvelope.enabled {
+                var unused = false
                 envVolume = envelopeStep(ins.volumeEnvelope, frame: &voices[c].volEnvFrame,
-                                         keyOff: voices[c].keyOff) / 64
+                                         keyOff: voices[c].keyOff, sustainLock: &unused,
+                                         stickySustain: false) / 64
             }
             var envPan = 32.0
             if ins.panningEnvelope.enabled {
-                envPan = envelopeStep(ins.panningEnvelope, frame: &voices[c].panEnvFrame,
-                                      keyOff: voices[c].keyOff)
+                var frame = voices[c].panEnvFrame
+                var locked = voices[c].panSustainLocked
+                envPan = envelopeStep(ins.panningEnvelope, frame: &frame,
+                                      keyOff: voices[c].keyOff, sustainLock: &locked)
+                voices[c].panEnvFrame = frame
+                voices[c].panSustainLocked = locked
             }
-            if voices[c].keyOff && ins.volumeEnvelope.enabled {
+            // Fade-out runs after every key-off, with or without a volume
+            // envelope (OpenMPT NoteOffFadeNoEnv.xm). A faded voice keeps
+            // running silently so portamento can pick it up again
+            // (FadeoutPickup.xm).
+            if voices[c].keyOff {
                 voices[c].fadeout = max(0, voices[c].fadeout - Int(ins.volumeFadeout))
-                if voices[c].fadeout == 0 { voices[c].active = false }
             }
 
             var period = voices[c].outPeriod
             let av = ins.autoVibrato
             if av.depth > 0 {
-                if voices[c].autoVibSweep > 0 && !voices[c].keyOff {
-                    voices[c].autoVibAmp += voices[c].autoVibSweep
-                    if voices[c].autoVibAmp >> 8 > Int(av.depth) {
-                        voices[c].autoVibAmp = Int(av.depth) << 8
-                        voices[c].autoVibSweep = 0
+                var amp = voices[c].autoVibAmp
+                if voices[c].autoVibSweep > 0 {
+                    if voices[c].keyOff {
+                        // Released mid-sweep: FT2 uses one sweep step as
+                        // the depth (OpenMPT AutoVibratoSweepKeyOff.xm).
+                        amp = voices[c].autoVibSweep
+                    } else {
+                        voices[c].autoVibAmp += voices[c].autoVibSweep
+                        if voices[c].autoVibAmp >> 8 > Int(av.depth) {
+                            voices[c].autoVibAmp = Int(av.depth) << 8
+                            voices[c].autoVibSweep = 0
+                        }
+                        amp = voices[c].autoVibAmp
                     }
                 }
                 voices[c].autoVibPos = (voices[c].autoVibPos + Int(av.rate)) & 0xFF
@@ -954,7 +1069,7 @@ public final class XMMixer: @unchecked Sendable {
                 case 3: wave = (((-(pos >> 1)) + 64) & 127) - 64
                 default: wave = Self.autoVibratoSine[pos]
                 }
-                period += Double((wave * voices[c].autoVibAmp) >> 14)
+                period += Double((wave * amp) >> 14)
             }
             period = min(Self.periodRange.upperBound, max(Self.periodRange.lowerBound, period))
             voices[c].step = frequency(forPeriod: period) / sampleRate
@@ -965,21 +1080,31 @@ public final class XMMixer: @unchecked Sendable {
 
             let pan = Double(voices[c].panning)
             let finalPan = pan + (envPan - 32) * (128 - abs(pan - 128)) / 32
-            voices[c].finalPan = Float(max(-1, min(1, (finalPan - 128) / 128)))
+            voices[c].finalPan = Float(max(0, min(255, finalPan)))
         }
     }
 
     /// Value of `envelope` at `frame`, then advance the frame with
     /// sustain and loop handling.
-    private func envelopeStep(_ env: XMInstrument.Envelope, frame: inout Int, keyOff: Bool) -> Double {
+    ///
+    /// With `stickySustain` (FT2's panning envelope), an envelope that
+    /// was already held at its sustain point when the key was released
+    /// stays held (OpenMPT PanSustainRelease.xm); `sustainLock` records
+    /// that it was held while the key was down.
+    private func envelopeStep(_ env: XMInstrument.Envelope, frame: inout Int, keyOff: Bool,
+                              sustainLock: inout Bool, stickySustain: Bool = true) -> Double {
         let points = env.points
         guard !points.isEmpty else { return 64 }
         let value = envelopeValue(points, at: frame)
 
         let count = points.count
-        if env.sustainEnabled, env.sustainPoint < count, !keyOff,
+        if env.sustainEnabled, env.sustainPoint < count,
            frame == Int(points[env.sustainPoint].frame) {
-            return value
+            if !keyOff {
+                if stickySustain { sustainLock = true }
+                return value
+            }
+            if sustainLock { return value }
         }
         frame += 1
         if env.loopEnabled, env.loopStart <= env.loopEnd, env.loopEnd < count,
@@ -1012,12 +1137,15 @@ public final class XMMixer: @unchecked Sendable {
     // MARK: - Frequency math
 
     /// Period for a 0-based note (C-0 = 0) and finetune (-128...127).
+    /// FT2 only uses the top five bits of the finetune (OpenMPT
+    /// Finetune-Precision.xm), rounding toward negative infinity.
     private func periodFor(note: Int, finetune: Int) -> Double {
+        let quantized = (finetune >> 3) << 3
         if linear {
-            return 7680 - Double(note * 64) - Double(finetune) / 2
+            return 7680 - Double(note * 64) - Double(quantized) / 2
         }
         let n = max(0, min(119, note))
-        let position = Double(n % 12 * 8 + 8) + Double(finetune) / 16
+        let position = Double(n % 12 * 8 + 8) + Double(quantized) / 16
         let i0 = Int(position.rounded(.down))
         let frac = position - Double(i0)
         func entry(_ i: Int) -> Double {
@@ -1036,18 +1164,24 @@ public final class XMMixer: @unchecked Sendable {
 
     private func snapToSemitone(_ period: Double, channel c: Int) -> Double {
         let finetune = voices[c].finetune
+        return periodFor(note: nearestNote(toPeriod: period, finetune: finetune), finetune: finetune)
+    }
+
+    /// The 0-based note (0...119) whose period at `finetune` is closest
+    /// to `period`.
+    private func nearestNote(toPeriod period: Double, finetune: Int) -> Int {
         if linear {
-            let note = ((7680 - period - Double(finetune) / 2) / 64).rounded()
-            return periodFor(note: Int(note), finetune: finetune)
+            let offset = Double((finetune >> 3) << 3) / 2
+            let note = ((7680 - period - offset) / 64).rounded()
+            return Int(max(0, min(119, note)))
         }
-        var best = period
+        var best = 0
         var bestDistance = Double.infinity
         for n in 0..<120 {
-            let candidate = periodFor(note: n, finetune: finetune)
-            let d = abs(candidate - period)
+            let d = abs(periodFor(note: n, finetune: finetune) - period)
             if d < bestDistance {
                 bestDistance = d
-                best = candidate
+                best = n
             }
         }
         return best

@@ -346,7 +346,10 @@ struct XMEffectTests {
         #expect(env.snapshot(channel: 0).fadeout == 32768 - 0x1000)
         #expect(env.snapshot(channel: 0).volume == 64)
         advance(env, frames: 8 * tickFrames)
-        #expect(!env.snapshot(channel: 0).active)
+        // The faded voice is silent but keeps running (FadeoutPickup.xm).
+        #expect(env.snapshot(channel: 0).fadeout == 0)
+        #expect(env.snapshot(channel: 0).finalVolume == 0)
+        #expect(env.snapshot(channel: 0).active)
     }
 
     @Test("Volume envelope interpolates, holds at sustain and releases on key off")
@@ -395,7 +398,8 @@ struct XMEffectTests {
         var ins = XMBuilder.Instrument()
         ins.panningEnvelope = .init(points: [(0, 64)], flags: 1)
         let m = try makeMixer(song([noteOn()], instruments: [ins]))
-        #expect(m.snapshot(channel: 0).finalPan == 1)
+        // 128 + (64 - 32) * 128 / 32 = 256, clamped to FT2's 0...255.
+        #expect(m.snapshot(channel: 0).finalPan == 255)
     }
 
     @Test("Auto-vibrato sweeps in and uses FT2's negative-first sine")
